@@ -2,6 +2,7 @@ package sesv2
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/sivchari/kumo/internal/service/ses"
@@ -12,10 +13,11 @@ import (
 func (s *Service) Mailbox(ctx context.Context, address string) ([]*ses.SentEmail, error) {
 	emails, err := s.storage.GetSentEmails(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read SESv2 mailbox: %w", err)
 	}
 
 	var result []*ses.SentEmail
+
 	for _, email := range emails {
 		var destinations []string
 		if email.Destination != nil {
