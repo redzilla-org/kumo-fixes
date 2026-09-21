@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -197,7 +198,7 @@ func (m *MemoryStorage) SendEmail(_ context.Context, email *SentEmail) (string, 
 	return email.MessageID, nil
 }
 
-// GetMailbox returns all sent emails for the given sender email address.
+// GetMailbox matches recipients as well as the existing sender-address lookup.
 func (m *MemoryStorage) GetMailbox(_ context.Context, email string) ([]*SentEmail, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -205,7 +206,7 @@ func (m *MemoryStorage) GetMailbox(_ context.Context, email string) ([]*SentEmai
 	var result []*SentEmail
 
 	for _, e := range m.Emails {
-		if e.Source == email {
+		if e.Source == email || slices.Contains(e.Destination, email) {
 			result = append(result, e)
 		}
 	}
