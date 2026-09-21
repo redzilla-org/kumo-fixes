@@ -494,12 +494,28 @@ func (m *MemoryStorage) PutItem(_ context.Context, tableName string, item Item, 
 	return oldItem, nil
 }
 
+// tableByIdentity accepts only the stored ARN, so another account or region cannot
+// address a local table merely by sharing its final resource name. Caller holds mu.
+func (m *MemoryStorage) tableByIdentity(identity string) (*tableData, bool) {
+	if td, ok := m.Tables[identity]; ok {
+		return td, true
+	}
+
+	for _, td := range m.Tables {
+		if td.Table.TableARN == identity {
+			return td, true
+		}
+	}
+
+	return nil, false
+}
+
 // GetItem gets an item from a table.
 func (m *MemoryStorage) GetItem(_ context.Context, tableName string, key Item) (Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentity(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -703,7 +719,7 @@ func (m *MemoryStorage) Query(_ context.Context, tableName, indexName, keyCondEx
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentity(tableName)
 	if !exists {
 		return nil, nil, 0, &TableError{
 			Code:    errCodeResourceNotFound,
