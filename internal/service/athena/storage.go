@@ -2,8 +2,11 @@ package athena
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +58,9 @@ type MemoryStorage struct {
 	WorkGroups      map[string]*WorkGroup      `json:"workGroups"`
 	QueryResults    map[string]*ResultSet      `json:"queryResults"`
 	dataDir         string
+	jobs            map[string]context.CancelFunc
+	workers         sync.WaitGroup
+	closing         bool
 }
 
 // NewMemoryStorage creates a new in-memory storage.
@@ -63,6 +69,7 @@ func NewMemoryStorage(opts ...Option) *MemoryStorage {
 		QueryExecutions: make(map[string]*QueryExecution),
 		WorkGroups:      make(map[string]*WorkGroup),
 		QueryResults:    make(map[string]*ResultSet),
+		jobs:            make(map[string]context.CancelFunc),
 	}
 
 	s.WorkGroups[defaultWorkGroupName] = &WorkGroup{
@@ -77,6 +84,16 @@ func NewMemoryStorage(opts ...Option) *MemoryStorage {
 
 	if s.dataDir != "" {
 		_ = storage.Load(s.dataDir, "athena", s)
+	}
+
+	// An interrupted process no longer owns the execution that was persisted.
+	for _, execution := range s.QueryExecutions {
+		if execution.Status.State == QueryExecutionStateQueued || execution.Status.State == QueryExecutionStateRunning {
+			now := time.Now()
+			execution.Status.State = QueryExecutionStateFailed
+			execution.Status.StateChangeReason = "execution interrupted by service restart"
+			execution.Status.CompletionDateTime = &now
+		}
 	}
 
 	return s
@@ -136,6 +153,14 @@ func (s *MemoryStorage) saveLocked() {
 
 // Close saves the storage state to disk if persistence is enabled.
 func (s *MemoryStorage) Close() error {
+	s.mu.Lock()
+	s.closing = true
+	for _, cancel := range s.jobs {
+		cancel()
+	}
+	s.mu.Unlock()
+	s.workers.Wait()
+
 	if s.dataDir == "" {
 		return nil
 	}
@@ -163,6 +188,19 @@ func (s *MemoryStorage) StartQueryExecution(_ context.Context, query, workGroup 
 		}
 	}
 
+	if s.closing {
+		return nil, &ServiceError{Code: errInvalidRequestException, Message: "service is closing"}
+	}
+
+	group := s.WorkGroups[workGroup]
+	if group.State != WorkGroupStateEnabled {
+		return nil, &ServiceError{Code: errInvalidRequestException, Message: "workgroup is disabled"}
+	}
+
+	if group.Configuration != nil && (resultConfig == nil || group.Configuration.EnforceWorkGroupConfiguration) {
+		resultConfig = group.Configuration.ResultConfiguration
+	}
+
 	queryExecutionID := uuid.New().String()
 	now := time.Now()
 
@@ -173,48 +211,28 @@ func (s *MemoryStorage) StartQueryExecution(_ context.Context, query, workGroup 
 		ResultConfiguration:   resultConfig,
 		QueryExecutionContext: execContext,
 		Status: &QueryExecutionStatus{
-			State:              QueryExecutionStateSucceeded,
+			State:              QueryExecutionStateQueued,
 			SubmissionDateTime: now,
-			CompletionDateTime: &now,
 		},
-		Statistics: &QueryExecutionStatistics{
-			EngineExecutionTimeInMillis:      100,
-			DataScannedInBytes:               1024,
-			TotalExecutionTimeInMillis:       150,
-			QueryQueueTimeInMillis:           10,
-			ServicePreProcessingTimeInMillis: 20,
-			QueryPlanningTimeInMillis:        10,
-			ServiceProcessingTimeInMillis:    10,
-		},
+		Statistics:          &QueryExecutionStatistics{},
 		WorkGroup:           workGroup,
 		ExecutionParameters: executionParams,
 		EngineVersion: &EngineVersion{
-			SelectedEngineVersion:  "AUTO",
-			EffectiveEngineVersion: "Athena engine version 3",
+			SelectedEngineVersion:  "kumo-local",
+			EffectiveEngineVersion: engineDescription,
 		},
 	}
 
+	qe = cloneExecution(qe)
 	s.QueryExecutions[queryExecutionID] = qe
-	s.QueryResults[queryExecutionID] = createMockResultSet()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.jobs[queryExecutionID] = cancel
+	s.workers.Add(1)
+	go s.execute(ctx, cloneExecution(qe))
 
 	s.saveLocked()
 
-	return qe, nil
-}
-
-func createMockResultSet() *ResultSet {
-	return &ResultSet{
-		Rows: []Row{
-			{Data: []Datum{{VarCharValue: "column1"}, {VarCharValue: "column2"}}},
-			{Data: []Datum{{VarCharValue: "value1"}, {VarCharValue: "value2"}}},
-		},
-		ResultSetMetadata: &ResultSetMetadata{
-			ColumnInfo: []ColumnInfo{
-				{Name: "column1", Type: "varchar", Nullable: "UNKNOWN"},
-				{Name: "column2", Type: "varchar", Nullable: "UNKNOWN"},
-			},
-		},
-	}
+	return cloneExecution(qe), nil
 }
 
 // StopQueryExecution stops a running query execution.
@@ -236,6 +254,9 @@ func (s *MemoryStorage) StopQueryExecution(_ context.Context, queryExecutionID s
 		qe.Status.State = QueryExecutionStateCancelled
 		qe.Status.StateChangeReason = "Query was cancelled by user."
 		qe.Status.CompletionDateTime = &now
+		if cancel := s.jobs[queryExecutionID]; cancel != nil {
+			cancel()
+		}
 	}
 
 	s.saveLocked()
@@ -256,11 +277,11 @@ func (s *MemoryStorage) GetQueryExecution(_ context.Context, queryExecutionID st
 		}
 	}
 
-	return qe, nil
+	return cloneExecution(qe), nil
 }
 
 // GetQueryResults retrieves results for a query execution.
-func (s *MemoryStorage) GetQueryResults(_ context.Context, queryExecutionID, _ string, _ int32) (*ResultSet, string, error) {
+func (s *MemoryStorage) GetQueryResults(_ context.Context, queryExecutionID, nextToken string, maxResults int32) (*ResultSet, string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -281,13 +302,35 @@ func (s *MemoryStorage) GetQueryResults(_ context.Context, queryExecutionID, _ s
 
 	rs, ok := s.QueryResults[queryExecutionID]
 	if !ok {
-		return &ResultSet{
-			Rows:              []Row{},
-			ResultSetMetadata: &ResultSetMetadata{ColumnInfo: []ColumnInfo{}},
-		}, "", nil
+		return nil, "", &ServiceError{Code: errInvalidRequestException, Message: "Stored query result is unavailable"}
 	}
 
-	return rs, "", nil
+	if maxResults == 0 {
+		maxResults = 1000
+	}
+	if maxResults < 1 || maxResults > 1000 {
+		return nil, "", &ServiceError{Code: errInvalidRequestException, Message: "MaxResults must be between 1 and 1000"}
+	}
+
+	start := 0
+	if nextToken != "" {
+		decoded, err := base64.RawURLEncoding.DecodeString(nextToken)
+		id, offset, ok := strings.Cut(string(decoded), ":")
+		position, parseErr := strconv.Atoi(offset)
+		if err != nil || parseErr != nil || !ok || id != queryExecutionID || position < 0 || position > len(rs.Rows) {
+			return nil, "", &ServiceError{Code: errInvalidRequestException, Message: "invalid query result token"}
+		}
+		start = position
+	}
+
+	end := min(start+int(maxResults), len(rs.Rows))
+	token := ""
+	if end < len(rs.Rows) {
+		token = base64.RawURLEncoding.EncodeToString([]byte(queryExecutionID + ":" + strconv.Itoa(end)))
+	}
+	page := &ResultSet{Rows: append([]Row(nil), rs.Rows[start:end]...), ResultSetMetadata: rs.ResultSetMetadata}
+
+	return page, token, nil
 }
 
 // ListQueryExecutions lists query execution IDs.
@@ -376,6 +419,9 @@ func (s *MemoryStorage) DeleteWorkGroup(_ context.Context, name string, recursiv
 	if recursiveDelete {
 		for id, qe := range s.QueryExecutions {
 			if qe.WorkGroup == name {
+				if cancel := s.jobs[id]; cancel != nil {
+					cancel()
+				}
 				delete(s.QueryExecutions, id)
 				delete(s.QueryResults, id)
 			}

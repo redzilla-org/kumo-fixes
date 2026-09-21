@@ -19,6 +19,9 @@
 - **AWS SDK v2 compatible** - Works seamlessly with Go AWS SDK v2
 - **Optional data persistence** - Survive restarts with `KUMO_DATA_DIR`
 
+Athena SQL execution requires the optional [native Athena image](docs/athena.md).
+The portable build reports execution unavailable instead of simulated query results.
+
 ## Supported Services (82 services)
 
 <!-- BEGIN SERVICES: auto-generated from each service's Meta(); run `make readme` to update. Do not edit by hand. -->
