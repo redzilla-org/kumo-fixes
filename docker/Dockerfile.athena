@@ -1,0 +1,43 @@
+# Native execution is opt-in; the ordinary portable image remains unchanged.
+FROM golang:1.26.8-bookworm AS builder
+ARG TARGETARCH
+WORKDIR /app
+
+# Use the SDK's matching public release, verifying bytes before unpacking.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/*
+RUN case "$TARGETARCH" in \
+      amd64) platform=linux-x86_64; checksum=251fca0c74384406278bd5faf02e9bc68a7a433963868e3961846d7c744c46a6 ;; \
+      arm64) platform=linux-aarch64; checksum=d88898e055e1d2923db3955c8a9be2cba9c5cdfed229ac542de20a5c88340171 ;; \
+      *) echo "Unsupported native architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --location "https://github.com/tobilg/polyglot/releases/download/v0.12.0/polyglot-sql-ffi-${platform}.tar.gz" -o /tmp/polyglot.tar.gz \
+    && echo "$checksum  /tmp/polyglot.tar.gz" | sha256sum --check --strict \
+    && mkdir -p /opt/polyglot \
+    && tar -xzf /tmp/polyglot.tar.gz --strip-components=1 -C /opt/polyglot \
+    && rm /tmp/polyglot.tar.gz
+
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# Preserve notices alongside the statically linked engine and dynamic translator.
+RUN mkdir -p /licenses \
+    && cp "$(go list -m -f '{{.Dir}}' github.com/duckdb/duckdb-go/v2)/LICENSE" /licenses/duckdb-go-LICENSE \
+    && cp "$(go list -m -f '{{.Dir}}' github.com/duckdb/duckdb-go-bindings)/LICENSE" /licenses/duckdb-LICENSE \
+    && cp /opt/polyglot/LICENSE /licenses/polyglot-LICENSE \
+    && CGO_ENABLED=1 go build -tags athena_native -ldflags="-s -w" -o /kumo ./cmd/kumo
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10000 --create-home kumo \
+    && mkdir -p /data && chown kumo:kumo /data
+COPY --from=builder /kumo /usr/local/bin/kumo
+COPY --from=builder /opt/polyglot/libpolyglot_sql_ffi.so /usr/local/lib/libpolyglot_sql_ffi.so
+COPY --from=builder /licenses /usr/share/licenses/kumo-athena
+ENV POLYGLOT_SQL_FFI_PATH=/usr/local/lib/libpolyglot_sql_ffi.so
+USER kumo
+EXPOSE 4566
+ENTRYPOINT ["kumo"]
+CMD ["--host", "0.0.0.0", "--port", "4566"]

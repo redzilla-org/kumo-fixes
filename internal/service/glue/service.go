@@ -25,6 +25,11 @@ type Service struct {
 	storage Storage
 }
 
+// Storage lets local analytical services resolve the same catalog as Glue APIs.
+func (s *Service) Storage() Storage {
+	return s.storage
+}
+
 // New creates a new Glue service.
 func New(storage Storage) *Service {
 	return &Service{

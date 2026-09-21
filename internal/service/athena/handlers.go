@@ -327,7 +327,14 @@ func convertResultSetToOutput(rs *ResultSet) *ResultSetOutput {
 		}
 
 		for _, datum := range row.Data {
-			rowOutput.Data = append(rowOutput.Data, DatumOutput(datum))
+			// A missing value is SQL NULL; a present empty string must stay present.
+			var value *string
+			if !datum.Null {
+				text := datum.VarCharValue
+				value = &text
+			}
+
+			rowOutput.Data = append(rowOutput.Data, DatumOutput{VarCharValue: value})
 		}
 
 		output.Rows = append(output.Rows, rowOutput)
