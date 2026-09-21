@@ -22,11 +22,13 @@ func normalizeParameterArray(body []byte) ([]byte, error) {
 		ParameterKey   string
 		ParameterValue string
 	}
+
 	if err := json.Unmarshal(raw, &entries); err != nil {
 		return nil, fmt.Errorf("decode Parameters array: %w", err)
 	}
 
 	parameters := make(map[string]string, len(entries))
+
 	for _, entry := range entries {
 		if entry.ParameterKey == "" {
 			return nil, fmt.Errorf("ParameterKey is required")
@@ -42,5 +44,10 @@ func normalizeParameterArray(body []byte) ([]byte, error) {
 
 	fields["Parameters"] = encoded
 
-	return json.Marshal(fields)
+	result, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode normalized request: %w", err)
+	}
+
+	return result, nil
 }
