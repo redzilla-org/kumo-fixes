@@ -12,6 +12,9 @@ RUN go mod download
 # Copy source
 COPY . .
 
+# Normalize copied Windows checkouts for truthful VCS stamps; real edits remain dirty.
+RUN git config --global core.autocrlf true
+
 # Build
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /kumo ./cmd/kumo
 
