@@ -911,6 +911,7 @@ func extractObjectMetadata(header http.Header) map[string]string {
 			metadata[name] = value
 		}
 	}
+
 	if ct := header.Get(contentTypeHeader); ct != "" {
 		metadata[contentTypeHeader] = ct
 	}
@@ -1118,6 +1119,7 @@ func writeRangeOrFull(w http.ResponseWriter, r *http.Request, obj *Object, range
 // matching Content-Range / Content-Length / object metadata headers.
 func writePartialObjectResponse(w http.ResponseWriter, obj *Object, start, end int64) {
 	length := end - start + 1
+
 	writeNativeObjectHeaders(w, obj)
 
 	setIfAbsent(w, "Content-Type", obj.ContentType)
