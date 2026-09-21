@@ -905,6 +905,12 @@ func (s *Service) getCopySource(ctx context.Context, bucket, key, versionID stri
 
 func extractObjectMetadata(header http.Header) map[string]string {
 	metadata := make(map[string]string)
+	// Canonical native names remain distinct from lower-case user metadata keys.
+	for _, name := range objectNativeHeaders {
+		if value := header.Get(name); value != "" {
+			metadata[name] = value
+		}
+	}
 	if ct := header.Get(contentTypeHeader); ct != "" {
 		metadata[contentTypeHeader] = ct
 	}
@@ -1112,6 +1118,7 @@ func writeRangeOrFull(w http.ResponseWriter, r *http.Request, obj *Object, range
 // matching Content-Range / Content-Length / object metadata headers.
 func writePartialObjectResponse(w http.ResponseWriter, obj *Object, start, end int64) {
 	length := end - start + 1
+	writeNativeObjectHeaders(w, obj)
 
 	setIfAbsent(w, "Content-Type", obj.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
@@ -1127,7 +1134,7 @@ func writePartialObjectResponse(w http.ResponseWriter, obj *Object, start, end i
 	}
 
 	for k, v := range obj.Metadata {
-		if k != contentTypeHeader {
+		if k != contentTypeHeader && !isNativeObjectHeader(k) {
 			w.Header().Set("x-amz-meta-"+k, v)
 		}
 	}
@@ -1242,6 +1249,7 @@ func handleGetObjectError(w http.ResponseWriter, r *http.Request, err error) {
 // Pre-existing header values (e.g. set by applyResponseHeaderOverrides
 // for presigned response-* overrides) are preserved.
 func writeObjectResponse(w http.ResponseWriter, obj *Object) {
+	writeNativeObjectHeaders(w, obj)
 	setIfAbsent(w, "Content-Type", obj.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("ETag", obj.ETag)
@@ -1253,7 +1261,7 @@ func writeObjectResponse(w http.ResponseWriter, obj *Object) {
 	}
 
 	for k, v := range obj.Metadata {
-		if k != contentTypeHeader {
+		if k != contentTypeHeader && !isNativeObjectHeader(k) {
 			w.Header().Set("x-amz-meta-"+k, v)
 		}
 	}
@@ -1435,14 +1443,16 @@ func (s *Service) HeadObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", obj.ContentType)
+	applyResponseHeaderOverrides(w, r.URL.Query())
+	writeNativeObjectHeaders(w, obj)
+	setIfAbsent(w, "Content-Type", obj.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.Header().Set("ETag", obj.ETag)
 	w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(timeFormatHTTP))
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	for k, v := range obj.Metadata {
-		if k != contentTypeHeader {
+		if k != contentTypeHeader && !isNativeObjectHeader(k) {
 			w.Header().Set("x-amz-meta-"+k, v)
 		}
 	}
