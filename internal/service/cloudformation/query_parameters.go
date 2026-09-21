@@ -12,6 +12,7 @@ import (
 // generic Query coercion can turn a CloudFormation parameter into a boolean/number.
 func restoreQueryParameters(r *http.Request, body []byte) ([]byte, error) {
 	parameters := make(map[string]string)
+
 	for key, values := range r.Form {
 		name, ok := strings.CutPrefix(key, "Parameters.member.")
 		if !ok || !strings.HasSuffix(name, ".ParameterKey") {
@@ -42,5 +43,10 @@ func restoreQueryParameters(r *http.Request, body []byte) ([]byte, error) {
 
 	fields["Parameters"] = encoded
 
-	return json.Marshal(fields)
+	result, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode restored Query request: %w", err)
+	}
+
+	return result, nil
 }
