@@ -14,6 +14,7 @@ func isNativeObjectHeader(name string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
