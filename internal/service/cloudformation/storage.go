@@ -141,13 +141,16 @@ func (m *MemoryStorage) CreateStack(_ context.Context, req *CreateStackRequest) 
 	stackID := generateStackID(req.StackName)
 	now := time.Now()
 
-	resources := parseTemplateResources(req.TemplateBody, stackID, req.StackName)
+	resources, parameters, err := resolvedTemplateResources(req.TemplateBody, stackID, req.StackName, req.Parameters)
+	if err != nil {
+		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
 
 	stack := &Stack{
 		StackID:         stackID,
 		StackName:       req.StackName,
 		TemplateBody:    req.TemplateBody,
-		Parameters:      req.Parameters,
+		Parameters:      parameters,
 		StackStatus:     StackStatusCreateComplete,
 		CreationTime:    now,
 		LastUpdatedTime: now,
@@ -238,16 +241,23 @@ func (m *MemoryStorage) UpdateStack(_ context.Context, req *UpdateStackRequest) 
 		return nil, &Error{Code: errInvalidParameter, Message: "TemplateBody is required for update"}
 	}
 
+	parameters := stack.Parameters
+	if req.Parameters != nil {
+		parameters = req.Parameters
+	}
+
+	resources, parameters, err := resolvedTemplateResources(req.TemplateBody, stack.StackID, stack.StackName, parameters)
+	if err != nil {
+		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
+
 	now := time.Now()
 	stack.TemplateBody = req.TemplateBody
 	stack.LastUpdatedTime = now
 	stack.StackStatus = StackStatusUpdateComplete
 
-	if req.Parameters != nil {
-		stack.Parameters = req.Parameters
-	}
-
-	stack.Resources = parseTemplateResources(req.TemplateBody, stack.StackID, stack.StackName)
+	stack.Parameters = parameters
+	stack.Resources = resources
 
 	m.saveLocked()
 
@@ -357,6 +367,20 @@ func parseTemplateParameter(key string, value any) TemplateParameter {
 
 // Helper functions.
 
+// Keep the original template for GetTemplate while materializing selected properties.
+func resolvedTemplateResources(body, stackID, stackName string, supplied map[string]string) ([]StackResource, map[string]string, error) {
+	if body == "" {
+		return parseTemplateResources(body, stackID, stackName), supplied, nil
+	}
+
+	evaluated, parameters, err := evaluateStackTemplate(body, supplied)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return parseTemplateResources(evaluated, stackID, stackName), parameters, nil
+}
+
 func generateStackID(stackName string) string {
 	return "arn:aws:cloudformation:us-east-1:123456789012:stack/" + stackName + "/" + uuid.New().String()
 }
@@ -382,6 +406,7 @@ func parseTemplateResources(templateBody, stackID, stackName string) []StackReso
 			}
 
 			if def, ok := resourceDef.(map[string]any); ok {
+				resource.Properties, _ = def["Properties"].(map[string]any)
 				if resourceType, ok := def["Type"].(string); ok {
 					resource.ResourceType = resourceType
 				}
