@@ -263,6 +263,7 @@ func (s *Service) GetMailbox(w http.ResponseWriter, r *http.Request) {
 
 			var more []*SentEmail
 			more, err = provider.Mailbox(r.Context(), email)
+
 			if err != nil {
 				break
 			}
@@ -270,6 +271,7 @@ func (s *Service) GetMailbox(w http.ResponseWriter, r *http.Request) {
 			emails = append(emails, more...)
 		}
 	}
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
