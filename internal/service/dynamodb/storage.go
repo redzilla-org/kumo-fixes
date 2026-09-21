@@ -500,11 +500,13 @@ func (m *MemoryStorage) tableByIdentity(identity string) (*tableData, bool) {
 	if td, ok := m.Tables[identity]; ok {
 		return td, true
 	}
+
 	for _, td := range m.Tables {
 		if td.Table.TableARN == identity {
 			return td, true
 		}
 	}
+
 	return nil, false
 }
 
