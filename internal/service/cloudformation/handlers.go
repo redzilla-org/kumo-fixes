@@ -392,6 +392,11 @@ func readCFNJSONRequest(r *http.Request, v any) error {
 		return fmt.Errorf("failed to read request body: %w", err)
 	}
 
+	body, err = restoreQueryParameters(r, body)
+	if err != nil {
+		return err
+	}
+
 	if len(body) == 0 {
 		return nil
 	}
