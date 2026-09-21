@@ -50,6 +50,7 @@ type StackResource struct {
 	Timestamp          time.Time
 	StackID            string
 	StackName          string
+	Properties         map[string]any
 }
 
 // TemplateValidationResult represents the result of template validation.
