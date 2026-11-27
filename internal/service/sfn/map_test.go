@@ -92,8 +92,7 @@ func TestMapStateIteratorAliasWorks(t *testing.T) {
 func TestMapStateItemFailureFailsTheMap(t *testing.T) {
 	t.Parallel()
 
-	// The item's processor has no listener at this port, so every item
-	// invocation fails and reports States.TaskFailed.
+	// The owned endpoint fails each item invocation with States.TaskFailed.
 	processor := `{
 		"StartAt": "Invoke",
 		"States": {
@@ -116,7 +115,7 @@ func TestMapStateItemFailureFailsTheMap(t *testing.T) {
 		}
 	}`
 
-	store := NewMemoryStorage(WithBaseURL("http://127.0.0.1:1"))
+	store := NewMemoryStorage(WithBaseURL(failedLambdaEndpoint(t)))
 	sm := createExecutionTestStateMachine(t, store, "map-item-fails", definition)
 
 	exec := startAndAwaitFailure(t, store, sm.StateMachineArn, threeItemArrayJSON)

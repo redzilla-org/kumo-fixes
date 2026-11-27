@@ -8,8 +8,8 @@ import (
 func TestTaskCatchRoutesToFallbackWithDefaultResultPath(t *testing.T) {
 	t.Parallel()
 
-	// No listener on this port, so the task invocation itself fails and
-	// reports States.TaskFailed, which the Catch below matches.
+	// The owned endpoint fails the task invocation and reports States.TaskFailed,
+	// which the Catch below matches without depending on a closed host port.
 	definition := `{
 		"StartAt": "Invoke",
 		"States": {
@@ -23,7 +23,7 @@ func TestTaskCatchRoutesToFallbackWithDefaultResultPath(t *testing.T) {
 		}
 	}`
 
-	store := NewMemoryStorage(WithBaseURL("http://127.0.0.1:1"))
+	store := NewMemoryStorage(WithBaseURL(failedLambdaEndpoint(t)))
 	sm := createExecutionTestStateMachine(t, store, "catch-default", definition)
 
 	exec := startAndAwaitSuccess(t, store, sm.StateMachineArn, `{"orig":"data"}`)
@@ -58,7 +58,7 @@ func TestTaskCatchInjectsErrorViaResultPath(t *testing.T) {
 		}
 	}`
 
-	store := NewMemoryStorage(WithBaseURL("http://127.0.0.1:1"))
+	store := NewMemoryStorage(WithBaseURL(failedLambdaEndpoint(t)))
 	sm := createExecutionTestStateMachine(t, store, "catch-resultpath", definition)
 
 	exec := startAndAwaitSuccess(t, store, sm.StateMachineArn, `{"orig":"data"}`)
@@ -100,7 +100,7 @@ func TestTaskCatchInjectsErrorViaDeepResultPath(t *testing.T) {
 		}
 	}`
 
-	store := NewMemoryStorage(WithBaseURL("http://127.0.0.1:1"))
+	store := NewMemoryStorage(WithBaseURL(failedLambdaEndpoint(t)))
 	sm := createExecutionTestStateMachine(t, store, "catch-deep-resultpath", definition)
 
 	exec := startAndAwaitSuccess(t, store, sm.StateMachineArn, `{"orig":"data"}`)

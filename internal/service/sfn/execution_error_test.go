@@ -2,6 +2,8 @@ package sfn
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -70,9 +72,8 @@ func TestFailedExecutionReportsTaskFailedForTaskInvocationError(t *testing.T) {
 		}
 	}`
 
-	// The engine's base URL points at a closed port, so the task invocation
-	// itself fails and must surface as States.TaskFailed.
-	store := NewMemoryStorage(WithBaseURL("http://127.0.0.1:1"))
+	// The owned endpoint returns a task-invocation failure without relying on host port refusal.
+	store := NewMemoryStorage(WithBaseURL(failedLambdaEndpoint(t)))
 	sm := createExecutionTestStateMachine(t, store, "task-error", definition)
 
 	exec := startAndAwaitFailure(t, store, sm.StateMachineArn, "{}")
@@ -80,6 +81,20 @@ func TestFailedExecutionReportsTaskFailedForTaskInvocationError(t *testing.T) {
 	if exec.Error != errorStatesTaskFailed {
 		t.Fatalf("task failure error code: got %q, want %q (cause: %s)", exec.Error, errorStatesTaskFailed, exec.Cause)
 	}
+}
+
+// failedLambdaEndpoint serves a failing Lambda invoke response. Connecting to
+// a closed port such as 127.0.0.1:1 can stall instead of being refused on some
+// hosts (for example WSL), so the tests own the failing HTTP boundary instead.
+func failedLambdaEndpoint(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"Type":"ServiceException","Message":"task invocation failed"}`))
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
 }
 
 func createExecutionTestStateMachine(t *testing.T, store *MemoryStorage, name, definition string) *StateMachine {
