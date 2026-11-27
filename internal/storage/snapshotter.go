@@ -25,9 +25,12 @@ type snapKey struct {
 	name    string
 }
 
+// snapshotEntry holds the latest flush callback for one destination. It is a
+// generic flush rather than a marshal so a service with its own on-disk layout
+// can persist itself (see ScheduleFlush).
 type snapshotEntry struct {
-	marshal Marshaler
-	dirty   bool
+	flush func() error
+	dirty bool
 }
 
 //nolint:gocheckglobals // a single process-wide debouncer coalesces all services' snapshots.
@@ -55,6 +58,24 @@ func ScheduleSave(dataDir, name string, marshal Marshaler) {
 		return
 	}
 
+	ScheduleFlush(dataDir, name, func() error {
+		data, err := marshal()
+		if err != nil {
+			return err
+		}
+
+		return writeSnapshot(dataDir, name, data)
+	})
+}
+
+// ScheduleFlush is ScheduleSave for services that persist themselves: flush is
+// invoked off the mutation path on the next tick and must take its own locks.
+// A failed flush leaves the entry dirty so the next tick retries.
+func ScheduleFlush(dataDir, name string, flush func() error) {
+	if dataDir == "" {
+		return
+	}
+
 	snapMu.Lock()
 
 	key := snapKey{dataDir: dataDir, name: name}
@@ -67,7 +88,7 @@ func ScheduleSave(dataDir, name string, marshal Marshaler) {
 		snapEntries[key] = e
 	}
 
-	e.marshal = marshal
+	e.flush = flush
 	e.dirty = true
 
 	startLoop := !snapStarted
@@ -129,8 +150,8 @@ func flushLoop() {
 // calls it on each tick; it is also exported so tests can force a flush.
 func FlushSnapshots() {
 	type job struct {
-		key     snapKey
-		marshal Marshaler
+		key   snapKey
+		flush func() error
 	}
 
 	snapMu.Lock()
@@ -141,7 +162,7 @@ func FlushSnapshots() {
 		if e.dirty {
 			e.dirty = false
 
-			jobs = append(jobs, job{key: key, marshal: e.marshal})
+			jobs = append(jobs, job{key: key, flush: e.flush})
 		}
 	}
 
@@ -151,12 +172,7 @@ func FlushSnapshots() {
 	// writeSnapshot does not create dataDir, so a flush racing with dataDir
 	// removal fails here instead of resurrecting the directory.
 	for _, j := range jobs {
-		data, err := j.marshal()
-		if err == nil {
-			err = writeSnapshot(j.key.dataDir, j.key.name, data)
-		}
-
-		if err != nil {
+		if err := j.flush(); err != nil {
 			// Marshal or write failed: re-mark dirty so the next tick retries.
 			snapMu.Lock()
 

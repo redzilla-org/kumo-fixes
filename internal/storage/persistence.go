@@ -60,6 +60,13 @@ func SaveBytes(dataDir, name string, data []byte) error {
 	return writeSnapshot(dataDir, name, data)
 }
 
+// WriteSnapshot is writeSnapshot for a service's own ScheduleFlush callback:
+// the S3 store encodes its index outside its lock and writes it here, keeping
+// the same no-resurrect guarantee as the generic background save.
+func WriteSnapshot(dataDir, name string, data []byte) error {
+	return writeSnapshot(dataDir, name, data)
+}
+
 // writeSnapshot atomically writes data to dataDir/{name}.json WITHOUT creating
 // dataDir. The background snapshotter uses it so that a flush which races with the
 // removal of dataDir (e.g. a test's t.TempDir cleanup) fails cleanly instead of
