@@ -442,6 +442,17 @@ type QueryResponse struct {
 	LastEvaluatedKey Item   `json:"LastEvaluatedKey,omitempty"`
 }
 
+// selectCount is the Select value asking Query/Scan for counts without items.
+const selectCount = "COUNT"
+
+// countResponse is the Query/Scan response for Select=COUNT: DynamoDB omits
+// Items entirely, so this shape has no Items field.
+type countResponse struct {
+	Count            int  `json:"Count"`
+	ScannedCount     int  `json:"ScannedCount"`
+	LastEvaluatedKey Item `json:"LastEvaluatedKey,omitempty"`
+}
+
 // ScanRequest is the request for Scan.
 type ScanRequest struct {
 	TableName                 string                    `json:"TableName"`
