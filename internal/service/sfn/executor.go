@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -254,9 +255,8 @@ type executionEngine struct {
 func newExecutionEngine(baseURL string) *executionEngine {
 	return &executionEngine{
 		baseURL: baseURL,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		// ASL task/execution contexts own the deadline; cold builds exceed 30s.
+		client:              &http.Client{},
 		tokens:              newTokenRegistry(),
 		activityQueues:      newActivityQueueRegistry(),
 		activityPollTimeout: activityPollTimeout,
@@ -527,6 +527,10 @@ func (e *executionEngine) executeTaskState(ctx context.Context, name string, sta
 // reported as States.TaskFailed.
 func wrapTaskResult(output string, err error) (string, error) {
 	if err != nil {
+		var functionErr *failStateError
+		if errors.As(err, &functionErr) {
+			return "", err
+		}
 		return "", &taskFailedError{err: err}
 	}
 
@@ -743,7 +747,9 @@ func (e *executionEngine) executeLambdaInvoke(ctx context.Context, params map[st
 		payload = []byte("{}")
 	}
 
-	respBody, err := e.callLambda(ctx, functionName, payload)
+	invocationType, _ := params["InvocationType"].(string)
+	qualifier, _ := params["Qualifier"].(string)
+	respBody, statusCode, executedVersion, err := e.invokeLambda(ctx, functionName, qualifier, invocationType, payload)
 	if err != nil {
 		return "", err
 	}
@@ -752,12 +758,17 @@ func (e *executionEngine) executeLambdaInvoke(ctx context.Context, params map[st
 
 	// Wrap Lambda response in the Step Functions format.
 	lambdaResult := map[string]any{
-		"StatusCode": http.StatusOK,
+		"StatusCode": statusCode,
+	}
+	if executedVersion != "" {
+		lambdaResult["ExecutedVersion"] = executedVersion
 	}
 
 	// Try to parse the response body as JSON for the Payload field.
 	var payloadValue any
-	if err := json.Unmarshal(respBody, &payloadValue); err == nil {
+	if len(respBody) == 0 {
+		// Event and DryRun have no payload; their HTTP status is still meaningful.
+	} else if err := json.Unmarshal(respBody, &payloadValue); err == nil {
 		lambdaResult["Payload"] = payloadValue
 	} else {
 		lambdaResult["Payload"] = string(respBody)
@@ -803,32 +814,72 @@ func (e *executionEngine) executeLambdaFunctionTask(ctx context.Context, name, r
 // callLambda performs the HTTP call to invoke a Lambda function and returns
 // the raw response body.
 func (e *executionEngine) callLambda(ctx context.Context, functionName string, payload []byte) ([]byte, error) {
-	invokeURL := fmt.Sprintf("%s/lambda/2015-03-31/functions/%s/invocations", e.baseURL, functionName)
+	body, _, _, err := e.invokeLambda(ctx, functionName, "", "RequestResponse", payload)
+	return body, err
+}
+
+// invokeLambda retains qualification and the invocation mode on the real API
+// request. A successful HTTP request can still carry a failed Lambda execution.
+func (e *executionEngine) invokeLambda(ctx context.Context, functionName, qualifier, invocationType string, payload []byte) ([]byte, int, string, error) {
+	if invocationType == "" {
+		invocationType = "RequestResponse"
+	}
+	expectedStatus := http.StatusOK
+	switch invocationType {
+	case "RequestResponse":
+	case "Event":
+		expectedStatus = http.StatusAccepted
+	case "DryRun":
+		expectedStatus = http.StatusNoContent
+	default:
+		return nil, 0, "", fmt.Errorf("lambda invoke: unsupported InvocationType %q", invocationType)
+	}
+	if split := strings.IndexByte(functionName, ':'); split >= 0 {
+		if qualifier == "" {
+			qualifier = functionName[split+1:]
+		}
+		functionName = functionName[:split]
+	}
+	invokeURL := fmt.Sprintf("%s/lambda/2015-03-31/functions/%s/invocations", e.baseURL, url.PathEscape(functionName))
+	if qualifier != "" {
+		invokeURL += "?Qualifier=" + url.QueryEscape(qualifier)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, invokeURL, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("lambda invoke: create request: %w", err)
+		return nil, 0, "", fmt.Errorf("lambda invoke: create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Amz-Invocation-Type", invocationType)
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("lambda invoke: send request: %w", err)
+		return nil, 0, "", fmt.Errorf("lambda invoke: send request: %w", err)
 	}
 
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("lambda invoke: read response: %w", err)
+		return nil, 0, "", fmt.Errorf("lambda invoke: read response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("lambda invoke: unexpected status %d: %s", resp.StatusCode, string(respBody))
+	if resp.StatusCode != expectedStatus {
+		return nil, 0, "", fmt.Errorf("lambda invoke: unexpected status %d: %s", resp.StatusCode, string(respBody))
+	}
+	if functionError := resp.Header.Get("X-Amz-Function-Error"); functionError != "" {
+		var failure struct {
+			ErrorType string `json:"errorType"`
+		}
+		_ = json.Unmarshal(respBody, &failure)
+		if failure.ErrorType == "" {
+			failure.ErrorType = "Lambda.Unknown"
+		}
+		return nil, 0, "", &failStateError{errorName: failure.ErrorType, cause: string(respBody)}
 	}
 
-	return respBody, nil
+	return respBody, resp.StatusCode, resp.Header.Get("X-Amz-Executed-Version"), nil
 }
 
 // extractLambdaFunctionName extracts the function name from an ARN or returns the input as-is.
@@ -840,7 +891,7 @@ func extractLambdaFunctionName(nameOrARN string) string {
 	// arn:aws:lambda:<region>:<account>:function:<name>
 	parts := strings.Split(nameOrARN, ":")
 	if len(parts) >= 7 {
-		return parts[6]
+		return strings.Join(parts[6:], ":")
 	}
 
 	return nameOrARN
