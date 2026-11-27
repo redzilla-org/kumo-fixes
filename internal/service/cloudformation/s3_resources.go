@@ -201,7 +201,7 @@ func provisionStackS3(ctx context.Context, stack *Stack, old *Stack) (err error)
 			return errors.New("S3 resource removal during update is not supported")
 		}
 	}
-	refs := map[string]string{"AWS::StackName": stack.StackName, "AWS::StackId": stack.StackID, "AWS::Region": "us-east-1", "AWS::AccountId": "123456789012", "AWS::Partition": "aws"}
+	refs := map[string]string{"AWS::StackName": stack.StackName, "AWS::StackId": stack.StackID, "AWS::Region": stackRegion(ctx), "AWS::AccountId": "123456789012", "AWS::Partition": "aws"}
 	for name, parameter := range template.Parameters {
 		if parameter.Default != nil {
 			refs[name] = fmt.Sprint(parameter.Default)

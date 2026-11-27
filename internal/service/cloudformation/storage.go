@@ -161,11 +161,12 @@ func (m *MemoryStorage) CreateStack(ctx context.Context, req *CreateStackRequest
 	if err := checkResourceTypes(stack); err != nil {
 		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
 	}
+	markInertResources(stack)
 	if err := provisionStackS3(ctx, stack, nil); err != nil {
 		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
 	}
 	// A failed table or parameter must not leave the stack's buckets behind.
-	if err := provisionStackResources(ctx, stack, nil); err != nil {
+	if err := provisionStackResources(ctx, stack); err != nil {
 		return nil, &Error{Code: errInvalidParameter, Message: errors.Join(err, deleteStackS3(ctx, stack)).Error()}
 	}
 	m.Stacks[req.StackName] = stack
@@ -276,13 +277,6 @@ func (m *MemoryStorage) UpdateStack(ctx context.Context, req *UpdateStackRequest
 
 	updated.Parameters = parameters
 	updated.Resources = resources
-	if err := checkResourceTypes(&updated); err != nil {
-		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
-	}
-	// Checked before S3 so a rejected update leaves no bucket or policy change behind.
-	if err := provisionStackResources(ctx, &updated, stack); err != nil {
-		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
-	}
 	if err := provisionStackS3(ctx, &updated, stack); err != nil {
 		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
 	}

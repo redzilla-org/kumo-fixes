@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
+	"strings"
 
 	"github.com/sivchari/kumo/internal/service"
 	"github.com/sivchari/kumo/internal/service/dynamodb"
@@ -13,6 +16,15 @@ import (
 
 const tableResource = "AWS::DynamoDB::Table"
 const parameterResource = "AWS::SSM::Parameter"
+
+// Materialization marker values recorded on each StackResource.
+const (
+	// MaterializationReal means the resource exists in the backing service store.
+	MaterializationReal = "MATERIALIZED"
+	// MaterializationInert means the resource is a stack record only; the marker
+	// makes that visible instead of reporting it as silently created.
+	MaterializationInert = "TRACKED_INERT"
+)
 
 // Types that are only tracked as stack records: nothing in the emulator enforces them.
 var inertResourceTypes = map[string]bool{
@@ -39,6 +51,62 @@ func checkResourceTypes(stack *Stack) error {
 	return nil
 }
 
+// Inert resources get a recognizable physical ID before anything Refs them.
+func markInertResources(stack *Stack) {
+	for i := range stack.Resources {
+		resource := &stack.Resources[i]
+		if inertResourceTypes[resource.ResourceType] {
+			resource.Materialization = MaterializationInert
+			resource.PhysicalResourceID = resource.LogicalResourceID + "-inert"
+		}
+	}
+}
+
+type stackRegionKey struct{}
+
+// The storage layer has no request, so the handler passes the region through the context.
+func withStackRegion(ctx context.Context, region string) context.Context {
+	return context.WithValue(ctx, stackRegionKey{}, region)
+}
+
+func stackRegion(ctx context.Context) string {
+	if region, ok := ctx.Value(stackRegionKey{}).(string); ok && region != "" {
+		return region
+	}
+
+	return "us-east-1"
+}
+
+// regionFromAuthHeader extracts the signing region from a SigV4 Authorization header
+// (Credential=AKID/20260101/us-west-2/cloudformation/aws4_request). Empty when absent.
+func regionFromAuthHeader(auth string) string {
+	i := strings.Index(auth, "Credential=")
+	if i < 0 {
+		return ""
+	}
+
+	parts := strings.Split(strings.SplitN(auth[i+len("Credential="):], ",", 2)[0], "/")
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+
+	return ""
+}
+
+// Precedence follows the other services, which read AWS_DEFAULT_REGION: the
+// configured region, then the request's signing region, then us-east-1.
+func resolveRegion(r *http.Request) string {
+	if v := os.Getenv("AWS_DEFAULT_REGION"); v != "" {
+		return v
+	}
+
+	if v := regionFromAuthHeader(r.Header.Get("Authorization")); v != "" {
+		return v
+	}
+
+	return "us-east-1"
+}
+
 // Resolve the registered stores at execution time, after all service initializers run.
 func stackDynamoDBStorage() (dynamodb.Storage, error) {
 	if svc, ok := service.Get("dynamodb"); ok {
@@ -62,21 +130,19 @@ func stackSSMStorage() (ssm.Storage, error) {
 
 // Runs after provisionStackS3, so Refs to buckets resolve to their real names.
 // Tables go before parameters because a parameter value commonly Refs a table.
-// On update, table and parameter definitions must be unchanged: applying a diff
-// is not supported, and silently keeping the old resource would hide that.
-func provisionStackResources(ctx context.Context, stack *Stack, old *Stack) (err error) {
+// Partial creations are undone here; the caller undoes the stack's S3 resources.
+func provisionStackResources(ctx context.Context, stack *Stack) (err error) {
+	for i := range stack.Resources {
+		resource := &stack.Resources[i]
+		if resource.ResourceType == bucketResource || resource.ResourceType == policyResource {
+			resource.Materialization = MaterializationReal
+		}
+	}
+
 	needed := false
 	for _, resource := range stack.Resources {
 		if resource.ResourceType == tableResource || resource.ResourceType == parameterResource {
 			needed = true
-		}
-	}
-
-	if old != nil {
-		for _, resource := range old.Resources {
-			if resource.ResourceType == tableResource || resource.ResourceType == parameterResource {
-				needed = true
-			}
 		}
 	}
 
@@ -89,10 +155,6 @@ func provisionStackResources(ctx context.Context, stack *Stack, old *Stack) (err
 		return fmt.Errorf("parse stack template: %w", err)
 	}
 
-	if old != nil {
-		return keepStackResources(stack, old, template)
-	}
-
 	tables, err := stackDynamoDBStorage()
 	if err != nil {
 		return err
@@ -103,7 +165,7 @@ func provisionStackResources(ctx context.Context, stack *Stack, old *Stack) (err
 		return err
 	}
 
-	refs := map[string]string{"AWS::StackName": stack.StackName, "AWS::StackId": stack.StackID, "AWS::Region": "us-east-1", "AWS::AccountId": "123456789012", "AWS::Partition": "aws", "AWS::URLSuffix": "amazonaws.com"}
+	refs := map[string]string{"AWS::StackName": stack.StackName, "AWS::StackId": stack.StackID, "AWS::Region": stackRegion(ctx), "AWS::AccountId": "123456789012", "AWS::Partition": "aws", "AWS::URLSuffix": "amazonaws.com"}
 	for name, parameter := range template.Parameters {
 		if parameter.Default != nil {
 			refs[name] = fmt.Sprint(parameter.Default)
@@ -145,9 +207,9 @@ func provisionStackResources(ctx context.Context, stack *Stack, old *Stack) (err
 
 			var name string
 			if kind == tableResource {
-				name, err = createStackTable(ctx, tables, properties, stack.StackName+"-"+resource.PhysicalResourceID)
+				name, err = createStackTable(ctx, tables, properties)
 			} else {
-				name, err = createStackParameter(ctx, params, properties, "CFN-"+resource.PhysicalResourceID)
+				name, err = createStackParameter(ctx, params, properties)
 			}
 
 			if err != nil {
@@ -161,6 +223,7 @@ func provisionStackResources(ctx context.Context, stack *Stack, old *Stack) (err
 			}
 
 			resource.PhysicalResourceID = name
+			resource.Materialization = MaterializationReal
 			refs[resource.LogicalResourceID] = name
 		}
 	}
@@ -168,51 +231,8 @@ func provisionStackResources(ctx context.Context, stack *Stack, old *Stack) (err
 	return nil
 }
 
-// Physical names survive an update only when the definition did not change.
-func keepStackResources(stack *Stack, old *Stack, template s3StackTemplate) error {
-	var oldTemplate s3StackTemplate
-	if err := json.Unmarshal([]byte(old.TemplateBody), &oldTemplate); err != nil {
-		return fmt.Errorf("parse previous stack template: %w", err)
-	}
-
-	prior := make(map[string]StackResource)
-	for _, resource := range old.Resources {
-		if resource.ResourceType == tableResource || resource.ResourceType == parameterResource {
-			prior[resource.LogicalResourceID] = resource
-		}
-	}
-
-	for i := range stack.Resources {
-		resource := &stack.Resources[i]
-		if resource.ResourceType != tableResource && resource.ResourceType != parameterResource {
-			continue
-		}
-
-		previous, ok := prior[resource.LogicalResourceID]
-		if !ok || previous.ResourceType != resource.ResourceType {
-			return fmt.Errorf("adding %s %s during update is not supported", resource.ResourceType, resource.LogicalResourceID)
-		}
-
-		before, _ := json.Marshal(oldTemplate.Resources[resource.LogicalResourceID].Properties)
-		after, _ := json.Marshal(template.Resources[resource.LogicalResourceID].Properties)
-
-		if string(before) != string(after) {
-			return fmt.Errorf("changing %s %s during update is not supported", resource.ResourceType, resource.LogicalResourceID)
-		}
-
-		resource.PhysicalResourceID = previous.PhysicalResourceID
-		delete(prior, resource.LogicalResourceID)
-	}
-
-	for logicalID, resource := range prior {
-		return fmt.Errorf("removing %s %s during update is not supported", resource.ResourceType, logicalID)
-	}
-
-	return nil
-}
-
 // The CFN property names used here match the DynamoDB API JSON, so a JSON round trip is the mapping.
-func createStackTable(ctx context.Context, tables dynamodb.Storage, properties map[string]any, generatedName string) (string, error) {
+func createStackTable(ctx context.Context, tables dynamodb.Storage, properties map[string]any) (string, error) {
 	raw, err := json.Marshal(properties)
 	if err != nil {
 		return "", fmt.Errorf("marshal table properties: %w", err)
@@ -223,9 +243,8 @@ func createStackTable(ctx context.Context, tables dynamodb.Storage, properties m
 		return "", fmt.Errorf("map table properties: %w", err)
 	}
 
-	// CloudFormation generates a name when TableName is omitted.
 	if req.TableName == "" {
-		req.TableName = generatedName
+		return "", errors.New("TableName is required; generated table names are not supported")
 	}
 
 	if _, err := tables.CreateTable(ctx, &req); err != nil {
@@ -248,7 +267,7 @@ func createStackTable(ctx context.Context, tables dynamodb.Storage, properties m
 }
 
 // The CFN property names used here match the SSM PutParameter JSON.
-func createStackParameter(ctx context.Context, params ssm.Storage, properties map[string]any, generatedName string) (string, error) {
+func createStackParameter(ctx context.Context, params ssm.Storage, properties map[string]any) (string, error) {
 	raw, err := json.Marshal(properties)
 	if err != nil {
 		return "", fmt.Errorf("marshal parameter properties: %w", err)
@@ -259,16 +278,13 @@ func createStackParameter(ctx context.Context, params ssm.Storage, properties ma
 		return "", fmt.Errorf("map parameter properties: %w", err)
 	}
 
-	if req.Value == "" || req.Type == "" {
-		return "", errors.New("SSM parameter requires Type and Value")
+	if req.Name == "" || req.Value == "" {
+		return "", errors.New("SSM parameter requires Name and Value")
 	}
 
-	// CloudFormation generates a name when Name is omitted.
-	if req.Name == "" {
-		req.Name = generatedName
-	}
+	// The stack owns the parameter, so an existing value is replaced.
+	req.Overwrite = true
 
-	// An existing parameter is a conflict, as on real CloudFormation, never an overwrite.
 	if _, err := params.PutParameter(ctx, &req); err != nil {
 		return "", err
 	}
@@ -276,11 +292,14 @@ func createStackParameter(ctx context.Context, params ssm.Storage, properties ma
 	return req.Name, nil
 }
 
-// Parameters are removed before tables, mirroring creation order; resources already gone are skipped.
+// Only materialized tables and parameters are removed, parameters first; any failure
+// fails DeleteStack so nothing leaks silently.
 func deleteStackResources(ctx context.Context, stack *Stack) error {
+	var errs []error
+
 	for _, kind := range []string{parameterResource, tableResource} {
 		for _, resource := range stack.Resources {
-			if resource.ResourceType != kind {
+			if resource.ResourceType != kind || resource.Materialization != MaterializationReal {
 				continue
 			}
 
@@ -290,11 +309,8 @@ func deleteStackResources(ctx context.Context, stack *Stack) error {
 					return err
 				}
 
-				err = params.DeleteParameter(ctx, resource.PhysicalResourceID)
-
-				var paramErr *ssm.ParameterError
-				if err != nil && (!errors.As(err, &paramErr) || paramErr.Type != ssm.ErrParameterNotFound) {
-					return err
+				if err := params.DeleteParameter(ctx, resource.PhysicalResourceID); err != nil {
+					errs = append(errs, fmt.Errorf("%s: %w", resource.LogicalResourceID, err))
 				}
 
 				continue
@@ -305,14 +321,11 @@ func deleteStackResources(ctx context.Context, stack *Stack) error {
 				return err
 			}
 
-			_, err = tables.DeleteTable(ctx, resource.PhysicalResourceID)
-
-			var tableErr *dynamodb.TableError
-			if err != nil && (!errors.As(err, &tableErr) || tableErr.Code != "ResourceNotFoundException") {
-				return err
+			if _, err := tables.DeleteTable(ctx, resource.PhysicalResourceID); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", resource.LogicalResourceID, err))
 			}
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
