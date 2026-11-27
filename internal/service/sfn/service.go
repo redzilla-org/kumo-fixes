@@ -23,6 +23,15 @@ func New(storage Storage) *Service {
 	}
 }
 
+// SetEndpoint binds integrations to the server that owns this service, before
+// accepting executions; non-default and ephemeral ports must not fall back to 4566.
+func (s *Service) SetEndpoint(endpoint string) {
+	if storage, ok := s.storage.(*MemoryStorage); ok {
+		storage.baseURL = endpoint
+		storage.engine.baseURL = endpoint
+	}
+}
+
 // Name returns the service name.
 func (s *Service) Name() string {
 	return "states"

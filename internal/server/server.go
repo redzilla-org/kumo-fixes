@@ -229,6 +229,22 @@ func (s *Server) Start(readyCh ...chan struct{}) error {
 		return fmt.Errorf("failed to listen on %s: %w", s.Addr(), err)
 	}
 
+	// Service integrations call this listener, including its assigned port when
+	// the caller requested port zero. Wildcard binds need a routable loopback host.
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("listener endpoint: %w", err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	for _, svc := range s.registry.All() {
+		if integration, ok := svc.(interface{ SetEndpoint(string) }); ok {
+			integration.SetEndpoint("http://" + net.JoinHostPort(host, port))
+		}
+	}
+
 	// Signal that the server is ready to accept connections.
 	if len(readyCh) > 0 && readyCh[0] != nil {
 		close(readyCh[0])
