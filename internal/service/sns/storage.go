@@ -50,6 +50,9 @@ type Storage interface {
 	ListTagsForResource(ctx context.Context, resourceArn string) ([]Tag, error)
 	TagResource(ctx context.Context, resourceArn string, tags []Tag) error
 	UntagResource(ctx context.Context, resourceArn string, tagKeys []string) error
+	// SNS message tap (tap.go): per-topic recording of every Publish.
+	PublishedMessages(topicARN string) []PublishedMessage
+	ClearPublishedMessages(topicARN string) int
 }
 
 // Option is a configuration option for MemoryStorage.
@@ -78,6 +81,10 @@ type MemoryStorage struct {
 	region        string
 	SqsPublisher  SQSPublisher `json:"-"`
 	dataDir       string
+	// SNS message tap (tap.go). In memory only: the recording is test
+	// evidence for the emulator's lifetime, not persisted resource state.
+	tapMu     sync.Mutex
+	published map[string][]PublishedMessage
 }
 
 // NewMemoryStorage creates a new in-memory SNS storage.
@@ -285,6 +292,11 @@ func (m *MemoryStorage) DeleteTopic(_ context.Context, topicARN string) error {
 	delete(m.Tags, topicARN)
 
 	m.saveLocked()
+
+	// SNS message tap: a deleted topic takes its recording with it, so a
+	// long-lived emulator never serves an earlier run's publishes under a
+	// recreated topic with the same ARN.
+	m.ClearPublishedMessages(topicARN)
 
 	return nil
 }
@@ -560,6 +572,10 @@ func (m *MemoryStorage) Publish(ctx context.Context, topicARN, message, subject,
 			continue
 		}
 	}
+
+	// SNS message tap: the topic exists, so this Publish succeeded whether
+	// or not any subscriber received it; record it for the tap.
+	m.recordPublish(topicARN, messageID, subject, message, attributes)
 
 	return messageID, nil
 }
