@@ -200,6 +200,7 @@ type MapRunListItem struct {
 
 // HistoryEvent represents a history event in an execution.
 type HistoryEvent struct {
+	HistoryDetails
 	Timestamp                      time.Time
 	Type                           HistoryEventType
 	ID                             int64
@@ -415,6 +416,7 @@ type GetExecutionHistoryResponse struct {
 
 // HistoryEventOutput represents a history event in the output.
 type HistoryEventOutput struct {
+	HistoryDetails
 	Timestamp                      float64                         `json:"timestamp"`
 	Type                           string                          `json:"type"`
 	ID                             int64                           `json:"id"`

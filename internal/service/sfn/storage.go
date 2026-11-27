@@ -2,13 +2,13 @@ package sfn
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -122,6 +122,8 @@ type MemoryStorage struct {
 type ExecutionData struct {
 	Execution *Execution      `json:"execution"`
 	History   []*HistoryEvent `json:"history"`
+	// StopExecution cancels the engine after the start request has returned.
+	cancel context.CancelFunc
 }
 
 // NewMemoryStorage creates a new in-memory storage.
@@ -342,7 +344,7 @@ func (s *MemoryStorage) startNestedExecution(ctx context.Context, stateMachineAr
 
 // startExecutionAtDepth is StartExecution/startNestedExecution's shared
 // implementation.
-func (s *MemoryStorage) startExecutionAtDepth(_ context.Context, stateMachineArn, name, input, traceHeader string, depth int) (*Execution, error) {
+func (s *MemoryStorage) startExecutionAtDepth(requestCtx context.Context, stateMachineArn, name, input, traceHeader string, depth int) (*Execution, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -365,7 +367,7 @@ func (s *MemoryStorage) startExecutionAtDepth(_ context.Context, stateMachineArn
 	now := time.Now()
 	exec := s.createExecution(executionArn, stateMachineArn, execName, input, traceHeader, now)
 
-	startID := atomic.AddInt64(&s.EventCounter, 1)
+	startID := int64(1)
 	history := []*HistoryEvent{
 		{
 			Timestamp: now, Type: HistoryEventTypeExecutionStarted, ID: startID, PreviousEventID: 0,
@@ -376,6 +378,9 @@ func (s *MemoryStorage) startExecutionAtDepth(_ context.Context, stateMachineArn
 	}
 
 	ed := &ExecutionData{Execution: exec, History: history}
+	// StartExecution is asynchronous: retain values, not the HTTP disconnect.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(requestCtx))
+	ed.cancel = cancel
 	s.Executions[executionArn] = ed
 
 	s.saveLocked()
@@ -383,128 +388,82 @@ func (s *MemoryStorage) startExecutionAtDepth(_ context.Context, stateMachineArn
 	// Parse the definition and run the state machine asynchronously.
 	definition := sm.Definition
 
-	go s.runExecution(ed, definition, input, startID, depth)
+	go s.runExecution(ctx, ed, definition, input, startID, depth)
 
 	return copyExecution(exec), nil
 }
 
-// executionTimeoutCap bounds how long a background execution goroutine may
-// run, independent of the definition's own TimeoutSeconds (real AWS has no
-// default execution timeout). This is purely an emulator resource cap and
-// must never be reported as a real States.Timeout -- see
-// executionTimeoutDiagnosis.
-const executionTimeoutCap = 5 * time.Minute
-
-// runExecution executes the state machine in a background goroutine, bounded
-// by min(definition TimeoutSeconds, executionTimeoutCap). depth is the
-// states:startExecution nesting depth (0 for a top-level execution).
-func (s *MemoryStorage) runExecution(ed *ExecutionData, definition, input string, lastEventID int64, depth int) {
+// runExecution obeys ASL TimeoutSeconds and explicit StopExecution, without an
+// emulator-only cap that truncates otherwise valid long-running Lambda builds.
+func (s *MemoryStorage) runExecution(ctx context.Context, ed *ExecutionData, definition, input string, lastEventID int64, depth int) {
+	defer ed.cancel()
 	def, err := parseDefinition(definition)
 	if err != nil {
 		s.failExecution(ed, lastEventID, errorStatesRuntime, fmt.Sprintf("Failed to parse definition: %v", err))
-
 		return
 	}
-
-	ctx, cancel, definitionTimeoutApplies := executionContext(def)
-	defer cancel()
-
+	if def.TimeoutSeconds != nil && *def.TimeoutSeconds > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(*def.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
 	ctx = withNestedExecutionDepth(ctx, depth)
 	ctx = withExecutionArn(ctx, ed.Execution.ExecutionArn)
-
+	ctx = context.WithValue(ctx, executionContextKey{}, map[string]any{
+		"Execution":    map[string]any{"Id": ed.Execution.ExecutionArn, "Name": ed.Execution.Name, "StartTime": ed.Execution.StartDate.UTC().Format(time.RFC3339Nano)},
+		"StateMachine": map[string]any{"Id": ed.Execution.StateMachineArn},
+	})
+	ctx = context.WithValue(ctx, historyContextKey{}, &historyCursor{last: lastEventID, region: s.region, append: func(event *HistoryEvent) int64 { return s.appendHistory(ed, event) }})
 	output, err := s.engine.execute(ctx, def, input)
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			code, cause := executionTimeoutDiagnosis(def, definitionTimeoutApplies)
-			s.failExecution(ed, lastEventID, code, cause)
-
+			s.finishExecution(ed, ExecutionStatusTimedOut, "", errorStatesTimeout, fmt.Sprintf("State machine execution exceeded its TimeoutSeconds (%d)", *def.TimeoutSeconds))
 			return
 		}
-
 		s.failExecution(ed, lastEventID, executionErrorCode(err), executionErrorCause(err))
-
 		return
 	}
-
 	s.succeedExecution(ed, lastEventID, output)
 }
 
-// executionContext builds the execution's context with deadline
-// min(definition TimeoutSeconds, executionTimeoutCap), so a runaway
-// execution can never leak a goroutine. definitionTimeoutApplies reports
-// whether the definition's own TimeoutSeconds was the tighter bound.
-func executionContext(def *stateMachineDefinition) (ctx context.Context, cancel context.CancelFunc, definitionTimeoutApplies bool) {
-	effective := executionTimeoutCap
-
-	if def.TimeoutSeconds != nil && *def.TimeoutSeconds > 0 {
-		defTimeout := time.Duration(*def.TimeoutSeconds) * time.Second
-		if defTimeout <= effective {
-			effective = defTimeout
-			definitionTimeoutApplies = true
-		}
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), effective)
-
-	return ctx, cancel, definitionTimeoutApplies
-}
-
-// executionTimeoutDiagnosis reports the timeout error code/cause: a reached
-// definition TimeoutSeconds is a real States.Timeout, while kumo's own
-// executionTimeoutCap firing is an emulator-only detail reported as
-// States.Runtime instead, keeping the two distinguishable.
-func executionTimeoutDiagnosis(def *stateMachineDefinition, definitionTimeoutApplies bool) (code, cause string) {
-	if definitionTimeoutApplies {
-		return errorStatesTimeout, fmt.Sprintf("State machine execution exceeded its TimeoutSeconds (%d)", *def.TimeoutSeconds)
-	}
-
-	return errorStatesRuntime, fmt.Sprintf(
-		"kumo enforced its internal %s execution cap; the state machine did not set a TimeoutSeconds within that bound",
-		executionTimeoutCap,
-	)
-}
-
 // succeedExecution marks an execution as SUCCEEDED.
-func (s *MemoryStorage) succeedExecution(ed *ExecutionData, lastEventID int64, output string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-	ed.Execution.Status = ExecutionStatusSucceeded
-	ed.Execution.StopDate = &now
-	ed.Execution.Output = output
-	ed.Execution.OutputDetails = &CloudWatchEventsExecutionDataDetails{Included: true}
-
-	eventID := atomic.AddInt64(&s.EventCounter, 1)
-	ed.History = append(ed.History, &HistoryEvent{
-		Timestamp: now, Type: HistoryEventTypeExecutionSucceeded, ID: eventID, PreviousEventID: lastEventID,
-		ExecutionSucceededEventDetails: &ExecutionSucceededEventDetails{
-			Output: output, OutputDetails: &CloudWatchEventsExecutionDataDetails{Included: true},
-		},
-	})
-
-	s.saveLocked()
+func (s *MemoryStorage) succeedExecution(ed *ExecutionData, _ int64, output string) {
+	s.finishExecution(ed, ExecutionStatusSucceeded, output, "", "")
 }
 
 // failExecution marks an execution as FAILED.
-func (s *MemoryStorage) failExecution(ed *ExecutionData, lastEventID int64, errorCode, cause string) {
+func (s *MemoryStorage) failExecution(ed *ExecutionData, _ int64, errorCode, cause string) {
+	s.finishExecution(ed, ExecutionStatusFailed, "", errorCode, cause)
+}
+
+// finishExecution shares StopExecution's lock so late HTTP responses cannot
+// overwrite ABORTED, and every execution owns its own sequential history IDs.
+func (s *MemoryStorage) finishExecution(ed *ExecutionData, status ExecutionStatus, output, errorCode, cause string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	if ed.Execution.Status != ExecutionStatusRunning {
+		return
+	}
 	now := time.Now()
-	ed.Execution.Status = ExecutionStatusFailed
+	ed.Execution.Status = status
 	ed.Execution.StopDate = &now
 	ed.Execution.Error = errorCode
 	ed.Execution.Cause = cause
-
-	eventID := atomic.AddInt64(&s.EventCounter, 1)
-	ed.History = append(ed.History, &HistoryEvent{
-		Timestamp: now, Type: HistoryEventTypeExecutionFailed, ID: eventID, PreviousEventID: lastEventID,
-		ExecutionFailedEventDetails: &ExecutionFailedEventDetails{
-			Error: errorCode, Cause: cause,
-		},
-	})
-
+	event := &HistoryEvent{Timestamp: now, ID: int64(len(ed.History)) + 1, PreviousEventID: int64(len(ed.History))}
+	switch status {
+	case ExecutionStatusSucceeded:
+		ed.Execution.Output = output
+		ed.Execution.OutputDetails = &CloudWatchEventsExecutionDataDetails{Included: true}
+		event.Type = HistoryEventTypeExecutionSucceeded
+		event.ExecutionSucceededEventDetails = &ExecutionSucceededEventDetails{Output: output, OutputDetails: ed.Execution.OutputDetails}
+	case ExecutionStatusTimedOut:
+		event.Type = HistoryEventTypeExecutionTimedOut
+		event.ExecutionTimedOutEventDetails = &ExecutionTimedOutEventDetails{Error: errorCode, Cause: cause}
+	default:
+		event.Type = HistoryEventTypeExecutionFailed
+		event.ExecutionFailedEventDetails = &ExecutionFailedEventDetails{Error: errorCode, Cause: cause}
+	}
+	ed.History = append(ed.History, event)
 	s.saveLocked()
 }
 
@@ -553,7 +512,10 @@ func (s *MemoryStorage) StopExecution(_ context.Context, executionArn, errorCode
 	ed.Execution.Cause = cause
 
 	// Add abort event.
-	eventID := atomic.AddInt64(&s.EventCounter, 1)
+	if ed.cancel != nil {
+		ed.cancel()
+	}
+	eventID := int64(len(ed.History)) + 1
 	abortEvent := &HistoryEvent{
 		Timestamp:       now,
 		Type:            HistoryEventTypeExecutionAborted,
@@ -667,35 +629,37 @@ func (s *MemoryStorage) ListMapRuns(_ context.Context, executionArn string, maxR
 	return mapRuns, "", nil
 }
 
-// GetExecutionHistory gets the history of an execution.
-func (s *MemoryStorage) GetExecutionHistory(_ context.Context, executionArn string, maxResults int32, _ string, reverseOrder bool) ([]*HistoryEvent, string, error) {
+// GetExecutionHistory paginates a stable snapshot, including while running.
+func (s *MemoryStorage) GetExecutionHistory(_ context.Context, executionArn string, maxResults int32, nextToken string, reverseOrder bool) ([]*HistoryEvent, string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	ed, exists := s.Executions[executionArn]
 	if !exists {
 		return nil, "", &ServiceError{Code: errExecutionDoesNotExist, Message: msgExecutionDoesNotExist}
 	}
-
 	if maxResults <= 0 {
 		maxResults = 100
 	}
-
-	// Copy events.
-	events := make([]*HistoryEvent, len(ed.History))
-	copy(events, ed.History)
-
+	page := historyPage{Execution: executionArn, Size: len(ed.History), Reverse: reverseOrder}
+	if nextToken != "" {
+		encoded, err := base64.RawURLEncoding.DecodeString(nextToken)
+		if err != nil || json.Unmarshal(encoded, &page) != nil || page.Execution != executionArn || page.Reverse != reverseOrder || page.Size < 0 || page.Size > len(ed.History) || page.Offset < 0 || page.Offset > page.Size {
+			return nil, "", &ServiceError{Code: "InvalidToken", Message: "Invalid execution history token"}
+		}
+	}
+	events := append([]*HistoryEvent{}, ed.History[:page.Size]...)
 	if reverseOrder {
 		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
 			events[i], events[j] = events[j], events[i]
 		}
 	}
-
-	if int32(len(events)) > maxResults { //nolint:gosec // slice length bounded by maxResults parameter
-		events = events[:maxResults]
+	end := min(page.Offset+int(maxResults), len(events))
+	result := events[page.Offset:end]
+	if end == len(events) {
+		return result, "", nil
 	}
-
-	return events, "", nil
+	page.Offset = end
+	return result, historyPageToken(page), nil
 }
 
 // TagResource adds tags to a resource.

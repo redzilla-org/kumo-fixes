@@ -283,19 +283,27 @@ func parseDefinition(definition string) (*stateMachineDefinition, error) {
 
 // execute runs the state machine and returns the output JSON string.
 func (e *executionEngine) execute(ctx context.Context, def *stateMachineDefinition, input string) (string, error) {
+	ctx = forkHistory(ctx)
 	currentState := def.StartAt
 	currentInput := input
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		state, ok := def.States[currentState]
 		if !ok {
 			return "", fmt.Errorf("state %q not found in definition", currentState)
 		}
 
-		output, nextOverride, err := e.executeState(ctx, currentState, &state, currentInput)
+		recordHistory(ctx, state.Type+"StateEntered", HistoryDetails{StateEnteredEventDetails: map[string]any{"name": currentState, "input": currentInput}})
+		data := contextData(ctx)
+		data["State"] = map[string]any{"Name": currentState, "EnteredTime": time.Now().UTC().Format(time.RFC3339Nano)}
+		output, nextOverride, err := e.executeState(context.WithValue(ctx, executionContextKey{}, data), currentState, &state, currentInput)
 		if err != nil {
 			return "", fmt.Errorf("execute state %q: %w", currentState, err)
 		}
+		recordHistory(ctx, state.Type+"StateExited", HistoryDetails{StateExitedEventDetails: map[string]any{"name": currentState, "output": output}})
 
 		// Succeed states are always terminal, regardless of End/Next.
 		if state.Type == stateTypeSucceed {
@@ -504,23 +512,25 @@ func (e *executionEngine) executeTaskState(ctx context.Context, name string, sta
 	}
 
 	// Resolve parameters with JSONPath references from input.
-	params, err := resolveParameters(state.Parameters, input)
+	params, err := resolveParametersWithContext(state.Parameters, input, contextData(ctx))
 	if err != nil {
 		return "", fmt.Errorf("resolve parameters for state %q: %w", name, err)
 	}
 
-	switch {
-	case resource == resourceSQSSendMessage:
-		return wrapTaskResult(e.executeSQSSendMessage(ctx, params))
-	case resource == resourceLambdaInvoke:
-		return wrapTaskResult(e.executeLambdaInvoke(ctx, params))
-	case strings.HasPrefix(resource, "arn:aws:lambda:"):
-		return wrapTaskResult(e.executeLambdaFunctionTask(ctx, name, resource, params, input))
-	case strings.HasPrefix(resource, resourceStartExecutionBase):
-		return wrapTaskResult(e.executeStartExecutionTask(ctx, resource, params))
-	default:
-		return "", fmt.Errorf("unsupported task resource %q", resource)
-	}
+	return recordTaskAttempt(ctx, state, params, input, func() (string, error) {
+		switch {
+		case resource == resourceSQSSendMessage:
+			return wrapTaskResult(e.executeSQSSendMessage(ctx, params))
+		case resource == resourceLambdaInvoke:
+			return wrapTaskResult(e.executeLambdaInvoke(ctx, params))
+		case strings.HasPrefix(resource, "arn:aws:lambda:"):
+			return wrapTaskResult(e.executeLambdaFunctionTask(ctx, name, resource, params, input))
+		case strings.HasPrefix(resource, resourceStartExecutionBase):
+			return wrapTaskResult(e.executeStartExecutionTask(ctx, resource, params))
+		default:
+			return "", fmt.Errorf("unsupported task resource %q", resource)
+		}
+	})
 }
 
 // wrapTaskResult wraps a task invocation failure in taskFailedError so it is
@@ -565,9 +575,8 @@ func resolveParameters(params map[string]any, input string) (map[string]any, err
 	return resolveParametersWithContext(params, input, nil)
 }
 
-// resolveParametersWithContext extends resolveParameters with an optional
-// Context object ($$.) lookup: contextData is nil everywhere except
-// ItemSelector, the only place ASL allows "$$." references.
+// resolveParametersWithContext resolves the execution/state identity, Map item
+// and callback token context supplied by the caller, alongside data references.
 func resolveParametersWithContext(params map[string]any, input string, contextData map[string]any) (map[string]any, error) {
 	if params == nil {
 		return map[string]any{}, nil
@@ -617,7 +626,7 @@ func resolveJSONPathRef(key string, value any, input string, inputData any, cont
 
 	if strings.HasPrefix(pathStr, "$$.") {
 		if contextData == nil {
-			return nil, inputData, fmt.Errorf("jsonPath reference for key %q uses the Context object (%q), which is only available in ItemSelector", key, pathStr)
+			return nil, inputData, fmt.Errorf("jsonPath reference for key %q requires unavailable Context object %q", key, pathStr)
 		}
 
 		resolvedValue, err := resolveAnyJSONPath("$"+strings.TrimPrefix(pathStr, "$$"), contextData)

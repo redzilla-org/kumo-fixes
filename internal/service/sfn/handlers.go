@@ -316,7 +316,8 @@ func (s *Service) GetExecutionHistory(w http.ResponseWriter, r *http.Request) {
 	eventOutputs := make([]HistoryEventOutput, len(events))
 	for i, event := range events {
 		eventOutputs[i] = HistoryEventOutput{
-			Timestamp:                      float64(event.Timestamp.Unix()),
+			HistoryDetails:                 event.HistoryDetails,
+			Timestamp:                      float64(event.Timestamp.UnixMicro()) / 1e6,
 			Type:                           string(event.Type),
 			ID:                             event.ID,
 			PreviousEventID:                event.PreviousEventID,
