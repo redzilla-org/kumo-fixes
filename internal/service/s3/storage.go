@@ -274,20 +274,15 @@ func NewMemoryStorage(opts ...Option) *MemoryStorage {
 }
 
 // MarshalJSON serializes the storage metadata to JSON. Object bodies are NOT
-// inlined: when persistence is enabled they are written to the blob store first
-// and the snapshot carries only a content reference per object (see blob.go and
-// Object.MarshalJSON). This keeps the whole-store marshal small and bounds its
-// peak memory, which is what stops the snapshot path from driving the process
-// into the OOM killer as the dataset grows.
+// inlined: the snapshot carries only a content reference per object (see
+// blob.go and Object.MarshalJSON). With persistence enabled every body is
+// already in its blob file, written by the request that stored it, so the
+// snapshot does no blob I/O while it holds the lock: no per-object write and
+// no scan of the objects directory. Orphaned blobs are pruned at startup and
+// Close only.
 func (s *MemoryStorage) MarshalJSON() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	if s.dataDir != "" {
-		if err := s.persistBodiesLocked(); err != nil {
-			return nil, err
-		}
-	}
 
 	type Alias MemoryStorage
 
@@ -336,61 +331,44 @@ func (s *MemoryStorage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// persistBodiesLocked writes every object body to the blob store and prunes
-// orphaned blobs. The caller must hold at least the read lock; bodies are only
-// read (never mutated), so snapshotting never blocks concurrent reads.
-func (s *MemoryStorage) persistBodiesLocked() error {
+// referencedBlobsLocked returns every live blob reference: object versions and
+// the parts of in-progress multipart uploads. It drives the orphan prune at
+// startup and Close, never the request or snapshot path. The caller must hold
+// at least the read lock.
+func (s *MemoryStorage) referencedBlobsLocked() map[string]struct{} {
 	referenced := make(map[string]struct{})
+
+	add := func(ref string) {
+		if ref != "" {
+			referenced[ref] = struct{}{}
+		}
+	}
 
 	for _, b := range s.Buckets {
 		for _, obj := range b.Objects {
-			if err := s.persistObjectBody(obj, referenced); err != nil {
-				return err
-			}
+			add(obj.effectiveRef())
 		}
 
 		for _, versions := range b.Versions {
 			for _, obj := range versions {
-				if err := s.persistObjectBody(obj, referenced); err != nil {
-					return err
-				}
+				add(obj.effectiveRef())
 			}
 		}
 
 		for _, upload := range b.MultipartUploads {
 			for _, part := range upload.Parts {
-				if part.bodyRef != "" {
-					referenced[part.bodyRef] = struct{}{}
-				}
+				add(part.bodyRef)
 			}
 		}
 	}
 
-	gcBlobs(s.dataDir, referenced)
-
-	return nil
-}
-
-// persistObjectBody writes one object's body to the blob store, recording its
-// reference in referenced (the live set used to GC orphans). Empty bodies carry
-// no blob: an empty or delete-marker object round-trips with a nil body.
-func (s *MemoryStorage) persistObjectBody(obj *Object, referenced map[string]struct{}) error {
-	ref := obj.effectiveRef()
-	if ref == "" {
-		return nil
-	}
-
-	referenced[ref] = struct{}{}
-
-	if len(obj.Body) == 0 {
-		return nil
-	}
-
-	return writeBlob(s.dataDir, ref, obj.Body)
+	return referenced
 }
 
 // loadBodiesLocked prepares objects restored from the metadata snapshot. Blob
 // bodies stay on disk and are loaded only when an operation needs their bytes.
+// Blobs no restored object references are pruned here, once, instead of on
+// every snapshot.
 func (s *MemoryStorage) loadBodiesLocked() error {
 	for _, b := range s.Buckets {
 		for _, obj := range b.Objects {
@@ -407,6 +385,8 @@ func (s *MemoryStorage) loadBodiesLocked() error {
 			}
 		}
 	}
+
+	gcBlobs(s.dataDir, s.referencedBlobsLocked())
 
 	return nil
 }
@@ -469,6 +449,12 @@ func (s *MemoryStorage) Close() error {
 	if err := storage.Save(s.dataDir, "s3", s); err != nil {
 		return fmt.Errorf("failed to save: %w", err)
 	}
+
+	// Shutdown is the other point where blobs orphaned by overwrites and
+	// deletes are pruned.
+	s.mu.RLock()
+	gcBlobs(s.dataDir, s.referencedBlobsLocked())
+	s.mu.RUnlock()
 
 	return nil
 }
@@ -594,6 +580,14 @@ func (s *MemoryStorage) materializeBody(body io.Reader) (storedBody, error) {
 // the write: two concurrent conditional PUTs can't both observe "no
 // current object" and both succeed.
 func (s *MemoryStorage) PutObjectIf(_ context.Context, bucket, key string, body io.Reader, metadata map[string]string, cond PutCondition) (*Object, error) {
+	// Consume the body before taking the lock, so a slow upload or a slow disk
+	// never stalls other requests. The bucket and precondition checks stay
+	// under the lock, atomic with the insert.
+	stored, err := s.materializeBody(body)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -603,11 +597,6 @@ func (s *MemoryStorage) PutObjectIf(_ context.Context, bucket, key string, body 
 	}
 
 	if err := checkPutCondition(b, key, cond); err != nil {
-		return nil, err
-	}
-
-	stored, err := s.materializeBody(body)
-	if err != nil {
 		return nil, err
 	}
 
@@ -679,8 +668,21 @@ func applySSEMetadata(obj *Object, metadata map[string]string) {
 	delete(metadata, "x-amz-server-side-encryption-aws-kms-key-id")
 }
 
-// GetObject retrieves an object.
-func (s *MemoryStorage) GetObject(_ context.Context, bucket, key string) (*Object, error) {
+// GetObject retrieves an object. Its body is read from disk after the lock is
+// released; a referenced blob is only pruned at startup or Close, so it cannot
+// vanish underneath the read.
+func (s *MemoryStorage) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
+	obj, err := s.getObject(ctx, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.objectWithBody(obj)
+}
+
+// getObject looks up the current version of an object under the read lock,
+// without its body.
+func (s *MemoryStorage) getObject(_ context.Context, bucket, key string) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -698,11 +700,23 @@ func (s *MemoryStorage) GetObject(_ context.Context, bucket, key string) (*Objec
 		return nil, &ObjectError{Code: errCodeNoSuchKey, Message: msgKeyNotExist, Key: key}
 	}
 
+	return obj, nil
+}
+
+// GetObjectVersion retrieves a specific version of an object, its body read
+// from disk after the lock is released (see GetObject).
+func (s *MemoryStorage) GetObjectVersion(ctx context.Context, bucket, key, versionID string) (*Object, error) {
+	obj, err := s.getObjectVersion(ctx, bucket, key, versionID)
+	if err != nil {
+		return nil, err
+	}
+
 	return s.objectWithBody(obj)
 }
 
-// GetObjectVersion retrieves a specific version of an object.
-func (s *MemoryStorage) GetObjectVersion(_ context.Context, bucket, key, versionID string) (*Object, error) {
+// getObjectVersion looks up one version of an object under the read lock,
+// without its body.
+func (s *MemoryStorage) getObjectVersion(_ context.Context, bucket, key, versionID string) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -718,7 +732,7 @@ func (s *MemoryStorage) GetObjectVersion(_ context.Context, bucket, key, version
 				return nil, &ObjectError{Code: "MethodNotAllowed", Message: "The specified method is not allowed against this resource.", Key: key}
 			}
 
-			return s.objectWithBody(obj)
+			return obj, nil
 		}
 	}
 
