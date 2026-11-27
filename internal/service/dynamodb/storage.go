@@ -1335,27 +1335,12 @@ func (m *MemoryStorage) attributeValuesEqual(a, b AttributeValue) bool {
 // applyUpdateExpression applies an update expression to an item.
 // Supports SET, ADD, DELETE, and REMOVE clauses.
 func (m *MemoryStorage) applyUpdateExpression(item Item, updateExpr string, exprNames map[string]string, exprValues map[string]AttributeValue) Item {
-	expr := updateExpr
-	for placeholder, name := range exprNames {
-		expr = strings.ReplaceAll(expr, placeholder, name)
+	// Transaction validation has already checked the identical update on a copy.
+	updated, err := m.applyDocumentUpdate(item, updateExpr, exprNames, exprValues)
+	if err != nil {
+		panic(err)
 	}
-
-	clauses := parseUpdateClauses(expr)
-
-	for _, clause := range clauses {
-		switch clause.action {
-		case updateActionSet:
-			item = applySetClause(item, clause.body, exprValues)
-		case updateActionAdd:
-			item = applyAddClause(item, clause.body, exprValues)
-		case updateActionDel:
-			item = applyDeleteClause(item, clause.body, exprValues)
-		case updateActionRem:
-			item = applyRemoveClause(item, clause.body)
-		}
-	}
-
-	return item
+	return updated
 }
 
 func (m *MemoryStorage) applyValidatedUpdateExpression(table *Table, item Item, updateExpr string, exprNames map[string]string, exprValues map[string]AttributeValue) (Item, error) {
@@ -1363,7 +1348,7 @@ func (m *MemoryStorage) applyValidatedUpdateExpression(table *Table, item Item, 
 		return nil, err
 	}
 
-	return m.applyUpdateExpression(item, updateExpr, exprNames, exprValues), nil
+	return m.applyDocumentUpdate(item, updateExpr, exprNames, exprValues)
 }
 
 func validateUpdateExpressionDoesNotTouchKeys(updateExpr string, exprNames map[string]string, keySchema []KeySchemaElement) error {
@@ -1376,10 +1361,13 @@ func validateUpdateExpressionDoesNotTouchKeys(updateExpr string, exprNames map[s
 		return nil
 	}
 
-	expr := resolveNames(updateExpr, exprNames)
-	for _, clause := range parseUpdateClauses(expr) {
+	for _, clause := range parseUpdateClauses(updateExpr) {
 		for _, path := range updatedAttributePaths(clause) {
-			attrName := topLevelAttribute(path)
+			parts, err := parseUpdatePath(path, exprNames)
+			if err != nil {
+				return err
+			}
+			attrName := parts[0].name
 			if _, ok := keyNames[attrName]; ok {
 				return &TableError{
 					Code:    errCodeValidation,
@@ -1994,6 +1982,13 @@ func (m *MemoryStorage) validateTransactUpdate(upd *TransactUpdate) (*Cancellati
 	}
 
 	if err := validateUpdateExpressionDoesNotTouchKeys(upd.UpdateExpression, upd.ExpressionAttributeNames, td.Table.KeySchema); err != nil {
+		return nil, err
+	}
+	item := td.Items[m.serializeKey(td.Table, upd.Key)]
+	if item == nil {
+		item = upd.Key
+	}
+	if _, err := m.applyDocumentUpdate(item, upd.UpdateExpression, upd.ExpressionAttributeNames, upd.ExpressionAttributeValues); err != nil {
 		return nil, err
 	}
 
