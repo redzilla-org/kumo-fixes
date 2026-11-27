@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -201,6 +203,111 @@ type MemoryStorage struct {
 	mu      sync.RWMutex             `json:"-"`
 	Buckets map[string]*MemoryBucket `json:"buckets"`
 	dataDir string
+
+	// pending holds bodies a PUT acknowledged before they reached disk, so a
+	// slow disk never sits on the request path. The background flusher writes
+	// them, then the index. GETs serve an unflushed body from here.
+	// Lock order: blobMu, then mu, then pendMu.
+	pendMu  sync.Mutex
+	pending map[string]pendingBlob
+	pendSeq uint64
+
+	// orphans is set (under mu) by a delete, so the next flush prunes blobs no
+	// object references; without it a cleared bucket's blobs would stay on
+	// disk until the next restart.
+	orphans bool
+
+	// blobMu is held for reading by every request that writes a blob file
+	// itself (large PUTs, multipart), from the write until the object or
+	// part referencing it is inserted. The prune takes it for writing, so it
+	// never removes a blob whose reference is not yet in the index.
+	blobMu sync.RWMutex
+
+	// flushMu serializes the background flush with Close: pending writes and
+	// the prune must never run beside each other.
+	flushMu sync.Mutex
+}
+
+// pendingBodyMax bounds the bodies a PUT keeps in memory until the flusher
+// writes them. A larger body streams to its blob file before the lock is
+// taken, so a single large upload never sits in RAM.
+const pendingBodyMax = 8 << 20
+
+// pendingBlob is one acknowledged body awaiting its blob file. seq lets the
+// flusher drop only the entry it wrote, never a later PUT of the same content.
+type pendingBlob struct {
+	data []byte
+	seq  uint64
+}
+
+// stageBlob records an acknowledged body for the flusher. The caller holds mu,
+// so the object insert and its pending body become visible together.
+func (s *MemoryStorage) stageBlob(ref string, data []byte) {
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+
+	if s.pending == nil {
+		s.pending = map[string]pendingBlob{}
+	}
+
+	s.pendSeq++
+	s.pending[ref] = pendingBlob{data: data, seq: s.pendSeq}
+}
+
+// pendingBody returns an acknowledged body not yet flushed to disk.
+func (s *MemoryStorage) pendingBody(ref string) ([]byte, bool) {
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+
+	p, ok := s.pending[ref]
+
+	return p.data, ok
+}
+
+// pendingBatchLocked copies the pending set. The caller holds mu, so the copy
+// covers every body the index copied under the same hold names.
+func (s *MemoryStorage) pendingBatchLocked() map[string]pendingBlob {
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+
+	batch := make(map[string]pendingBlob, len(s.pending))
+	for ref, p := range s.pending {
+		batch[ref] = p
+	}
+
+	return batch
+}
+
+// writePendingBlobs writes batch to blob files without any storage lock, then
+// forgets each entry it wrote. A failure keeps the rest pending, and the
+// snapshotter retries the flush on the next tick.
+func (s *MemoryStorage) writePendingBlobs(batch map[string]pendingBlob) (int, error) {
+	// writeBlob creates the objects directory; never resurrect a removed
+	// data dir from the background flusher.
+	if len(batch) > 0 {
+		if _, err := os.Stat(s.dataDir); err != nil {
+			return 0, fmt.Errorf("failed to stat data directory %s: %w", s.dataDir, err)
+		}
+	}
+
+	written := 0
+
+	for ref, p := range batch {
+		if err := writeBlob(s.dataDir, ref, p.data); err != nil {
+			return written, err
+		}
+
+		// Drop only what was written: a newer PUT of the same ref keeps its entry.
+		s.pendMu.Lock()
+		if cur, ok := s.pending[ref]; ok && cur.seq == p.seq {
+			delete(s.pending, ref)
+		}
+		s.pendMu.Unlock()
+
+		written++
+	}
+
+	return written, nil
 }
 
 // MemoryBucket holds the data for a single S3 bucket.
@@ -274,29 +381,163 @@ func NewMemoryStorage(opts ...Option) *MemoryStorage {
 }
 
 // MarshalJSON serializes the storage metadata to JSON. Object bodies are NOT
-// inlined: when persistence is enabled they are written to the blob store first
-// and the snapshot carries only a content reference per object (see blob.go and
-// Object.MarshalJSON). This keeps the whole-store marshal small and bounds its
-// peak memory, which is what stops the snapshot path from driving the process
-// into the OOM killer as the dataset grows.
+// inlined: the snapshot carries only a content reference per object (see
+// blob.go and Object.MarshalJSON). The snapshot does no blob I/O: bodies reach
+// disk through the request that stored them or the background flush. The
+// lock covers only a copy of the index; the encode runs outside it. Close
+// writes pending bodies before it calls this.
 func (s *MemoryStorage) MarshalJSON() ([]byte, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	snap := s.snapshotLocked()
+	s.mu.RUnlock()
 
-	if s.dataDir != "" {
-		if err := s.persistBodiesLocked(); err != nil {
-			return nil, err
-		}
-	}
-
-	type Alias MemoryStorage
-
-	data, err := json.Marshal(&struct{ *Alias }{Alias: (*Alias)(s)})
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal: %w", err)
 	}
 
 	return data, nil
+}
+
+// storageSnapshot is the s3.json document: the same {"buckets": ...} shape the
+// whole MemoryStorage marshals to, so existing data dirs load unchanged.
+type storageSnapshot struct {
+	Buckets map[string]*MemoryBucket `json:"buckets"`
+}
+
+// snapshotLocked copies the index for encoding outside the lock: encoding a
+// large index under the read lock stalled every PUT behind the flush. Objects
+// are copied by value and the maps mutated in place are cloned; every other
+// bucket field is replaced wholesale on write, so sharing it is safe. The
+// caller holds mu (read or write).
+func (s *MemoryStorage) snapshotLocked() storageSnapshot {
+	copyObj := func(o *Object) *Object {
+		c := *o
+
+		return &c
+	}
+
+	snap := storageSnapshot{Buckets: make(map[string]*MemoryBucket, len(s.Buckets))}
+
+	for name, b := range s.Buckets {
+		cb := *b
+
+		cb.Objects = make(map[string]*Object, len(b.Objects))
+		for k, o := range b.Objects {
+			cb.Objects[k] = copyObj(o)
+		}
+
+		cb.Versions = make(map[string][]*Object, len(b.Versions))
+		for k, vs := range b.Versions {
+			cvs := make([]*Object, len(vs))
+			for i, o := range vs {
+				cvs[i] = copyObj(o)
+			}
+
+			cb.Versions[k] = cvs
+		}
+
+		if b.ObjectACLs != nil {
+			cb.ObjectACLs = maps.Clone(b.ObjectACLs)
+		}
+
+		if b.ObjectRestores != nil {
+			cb.ObjectRestores = maps.Clone(b.ObjectRestores)
+		}
+
+		snap.Buckets[name] = &cb
+	}
+
+	return snap
+}
+
+// slowFlushLog is the flush duration worth one log line. The split it prints
+// (lock hold, blob writes, encode, index write, prune) locates a slow flush;
+// a healthy flush stays silent.
+const slowFlushLog = 250 * time.Millisecond
+
+// flush is the background persistence step. Under the lock it copies the index
+// and the pending bodies that index names. Outside the lock it writes those
+// bodies first, so the index on disk never names a blob that is not there,
+// then encodes and writes the index, then, after a delete, prunes orphans.
+func (s *MemoryStorage) flush() error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	start := time.Now()
+
+	s.mu.Lock()
+	snap := s.snapshotLocked()
+	batch := s.pendingBatchLocked()
+	prune := s.orphans
+	s.orphans = false
+	s.mu.Unlock()
+
+	copied := time.Now()
+
+	// A failed write re-arms the prune; the snapshotter retries the flush.
+	fail := func(err error) error {
+		if prune {
+			s.mu.Lock()
+			s.orphans = true
+			s.mu.Unlock()
+		}
+
+		return err
+	}
+
+	blobs, err := s.writePendingBlobs(batch)
+	if err != nil {
+		return fail(err)
+	}
+
+	blobsDone := time.Now()
+
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return fail(fmt.Errorf("failed to marshal: %w", err))
+	}
+
+	encoded := time.Now()
+
+	if err := storage.WriteSnapshot(s.dataDir, "s3", data); err != nil {
+		return fail(err)
+	}
+
+	written := time.Now()
+
+	// Pruned only after the new index is on disk, so a crash never leaves an
+	// index naming a removed blob.
+	pruned := 0
+	if prune {
+		pruned = s.pruneBlobs()
+	}
+
+	if total := time.Since(start); total >= slowFlushLog {
+		slog.Info("s3 flush",
+			"lockHeld", copied.Sub(start), "blobs", blobs, "blobWrite", blobsDone.Sub(copied),
+			"encode", encoded.Sub(blobsDone), "indexBytes", len(data),
+			"indexWrite", written.Sub(encoded), "pruned", pruned,
+			"prune", time.Since(written), "total", total)
+	}
+
+	return nil
+}
+
+// pruneBlobs removes blobs no object or part references. blobMu keeps every
+// request that writes its own blob file out until the scan ends, and the live
+// set is taken after that, so a just-written blob is always in it. A staged
+// body's object is inserted under mu together with its pending entry, so it is
+// in the live set too.
+func (s *MemoryStorage) pruneBlobs() int {
+	s.blobMu.Lock()
+	defer s.blobMu.Unlock()
+
+	s.mu.RLock()
+	referenced := s.referencedBlobsLocked()
+	s.mu.RUnlock()
+
+	return gcBlobs(s.dataDir, referenced)
 }
 
 // UnmarshalJSON restores the storage metadata from JSON and, when persistence is
@@ -336,61 +577,44 @@ func (s *MemoryStorage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// persistBodiesLocked writes every object body to the blob store and prunes
-// orphaned blobs. The caller must hold at least the read lock; bodies are only
-// read (never mutated), so snapshotting never blocks concurrent reads.
-func (s *MemoryStorage) persistBodiesLocked() error {
+// referencedBlobsLocked returns every live blob reference: object versions and
+// the parts of in-progress multipart uploads. It drives the orphan prune at
+// startup, at Close and in the flush after a delete; never the request path.
+// The caller must hold at least the read lock.
+func (s *MemoryStorage) referencedBlobsLocked() map[string]struct{} {
 	referenced := make(map[string]struct{})
+
+	add := func(ref string) {
+		if ref != "" {
+			referenced[ref] = struct{}{}
+		}
+	}
 
 	for _, b := range s.Buckets {
 		for _, obj := range b.Objects {
-			if err := s.persistObjectBody(obj, referenced); err != nil {
-				return err
-			}
+			add(obj.effectiveRef())
 		}
 
 		for _, versions := range b.Versions {
 			for _, obj := range versions {
-				if err := s.persistObjectBody(obj, referenced); err != nil {
-					return err
-				}
+				add(obj.effectiveRef())
 			}
 		}
 
 		for _, upload := range b.MultipartUploads {
 			for _, part := range upload.Parts {
-				if part.bodyRef != "" {
-					referenced[part.bodyRef] = struct{}{}
-				}
+				add(part.bodyRef)
 			}
 		}
 	}
 
-	gcBlobs(s.dataDir, referenced)
-
-	return nil
-}
-
-// persistObjectBody writes one object's body to the blob store, recording its
-// reference in referenced (the live set used to GC orphans). Empty bodies carry
-// no blob: an empty or delete-marker object round-trips with a nil body.
-func (s *MemoryStorage) persistObjectBody(obj *Object, referenced map[string]struct{}) error {
-	ref := obj.effectiveRef()
-	if ref == "" {
-		return nil
-	}
-
-	referenced[ref] = struct{}{}
-
-	if len(obj.Body) == 0 {
-		return nil
-	}
-
-	return writeBlob(s.dataDir, ref, obj.Body)
+	return referenced
 }
 
 // loadBodiesLocked prepares objects restored from the metadata snapshot. Blob
 // bodies stay on disk and are loaded only when an operation needs their bytes.
+// Blobs no restored object references are pruned here, once, instead of on
+// every snapshot.
 func (s *MemoryStorage) loadBodiesLocked() error {
 	for _, b := range s.Buckets {
 		for _, obj := range b.Objects {
@@ -407,6 +631,8 @@ func (s *MemoryStorage) loadBodiesLocked() error {
 			}
 		}
 	}
+
+	gcBlobs(s.dataDir, s.referencedBlobsLocked())
 
 	return nil
 }
@@ -432,17 +658,24 @@ func (s *MemoryStorage) loadObjectBody(obj *Object) error {
 	return nil
 }
 
-// objectWithBody returns a shallow copy whose body is loaded from the blob
+// objectWithBody returns a shallow copy whose body is filled in: from the
+// pending set when the flusher has not written it yet, else from the blob
 // store. The stored object remains metadata-only so a GET does not permanently
-// increase the resident set.
+// increase the resident set. The flusher writes a blob before it drops the
+// pending entry, so one of the two always holds the body.
 func (s *MemoryStorage) objectWithBody(obj *Object) (*Object, error) {
 	if s.dataDir == "" || obj.bodyRef == "" || len(obj.Body) > 0 {
 		return obj, nil
 	}
 
-	body, err := readBlob(s.dataDir, obj.bodyRef)
-	if err != nil {
-		return nil, err
+	body, ok := s.pendingBody(obj.bodyRef)
+	if !ok {
+		var err error
+
+		body, err = readBlob(s.dataDir, obj.bodyRef)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	clone := *obj
@@ -457,18 +690,34 @@ func (s *MemoryStorage) saveLocked() {
 		return
 	}
 
-	storage.ScheduleSave(s.dataDir, "s3", s.MarshalJSON)
+	storage.ScheduleFlush(s.dataDir, "s3", s.flush)
 }
 
-// Close saves the storage state to disk if persistence is enabled.
+// Close writes every pending body and the final index, then prunes orphans.
 func (s *MemoryStorage) Close() error {
 	if s.dataDir == "" {
 		return nil
 	}
 
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	// Bodies first, so the final index names no blob missing from disk. Close
+	// runs once requests have stopped, so nothing stages a body after this.
+	s.mu.RLock()
+	batch := s.pendingBatchLocked()
+	s.mu.RUnlock()
+
+	if _, err := s.writePendingBlobs(batch); err != nil {
+		return fmt.Errorf("failed to save: %w", err)
+	}
+
 	if err := storage.Save(s.dataDir, "s3", s); err != nil {
 		return fmt.Errorf("failed to save: %w", err)
 	}
+
+	// Shutdown also prunes blobs orphaned by overwrites, which no delete flags.
+	s.pruneBlobs()
 
 	return nil
 }
@@ -511,6 +760,9 @@ func (s *MemoryStorage) DeleteBucket(_ context.Context, name string) error {
 	}
 
 	delete(s.Buckets, name)
+
+	// Noncurrent versions may have gone with the bucket; prune next flush.
+	s.orphans = true
 
 	s.saveLocked()
 
@@ -589,11 +841,65 @@ func (s *MemoryStorage) materializeBody(body io.Reader) (storedBody, error) {
 	}, nil
 }
 
+// spoolBody consumes a PUT body for PutObjectIf. With a data dir, a body of up
+// to pendingBodyMax stays in memory and is reported pending: the PUT is
+// acknowledged without touching disk and the flusher writes the blob. A larger
+// body streams to its blob file under blobMu, held for reading until the
+// caller calls the returned release after inserting the object; only such
+// uploads ever wait on a prune. Without a data dir it is materializeBody.
+func (s *MemoryStorage) spoolBody(body io.Reader) (_ storedBody, pending bool, release func(), _ error) {
+	release = func() {}
+
+	if s.dataDir == "" {
+		stored, err := s.materializeBody(body)
+
+		return stored, false, release, err
+	}
+
+	head, err := io.ReadAll(io.LimitReader(body, pendingBodyMax+1))
+	if err != nil {
+		return storedBody{}, false, release, fmt.Errorf("failed to read body: %w", err)
+	}
+
+	if len(head) > pendingBodyMax {
+		s.blobMu.RLock()
+
+		blob, err := writeBlobStream(s.dataDir, io.MultiReader(bytes.NewReader(head), body))
+		if err != nil {
+			s.blobMu.RUnlock()
+
+			return storedBody{}, false, release, err
+		}
+
+		return storedBody{bodyRef: blob.ref, etag: blob.etag, size: blob.size}, false, s.blobMu.RUnlock, nil
+	}
+
+	hash := md5.Sum(head) //nolint:gosec // MD5 is required for S3 ETag calculation per AWS specification
+
+	return storedBody{
+		data:    head,
+		bodyRef: bodyRefOf(head),
+		etag:    hex.EncodeToString(hash[:]),
+		size:    int64(len(head)),
+	}, true, release, nil
+}
+
 // PutObjectIf implements Storage.PutObjectIf. The precondition check
 // happens under the same lock as the insert below, so it is atomic with
 // the write: two concurrent conditional PUTs can't both observe "no
 // current object" and both succeed.
 func (s *MemoryStorage) PutObjectIf(_ context.Context, bucket, key string, body io.Reader, metadata map[string]string, cond PutCondition) (*Object, error) {
+	// Consume the body before taking the lock, so a slow upload or a slow disk
+	// never stalls other requests. The bucket and precondition checks stay
+	// under the lock, atomic with the insert. release runs after mu unlocks
+	// (defers run last-in first-out), keeping the blobMu-then-mu order.
+	stored, pending, release, err := s.spoolBody(body)
+	if err != nil {
+		return nil, err
+	}
+
+	defer release()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -603,11 +909,6 @@ func (s *MemoryStorage) PutObjectIf(_ context.Context, bucket, key string, body 
 	}
 
 	if err := checkPutCondition(b, key, cond); err != nil {
-		return nil, err
-	}
-
-	stored, err := s.materializeBody(body)
-	if err != nil {
 		return nil, err
 	}
 
@@ -621,6 +922,13 @@ func (s *MemoryStorage) PutObjectIf(_ context.Context, bucket, key string, body 
 		Size:         size,
 		LastModified: time.Now(),
 		Metadata:     metadata,
+	}
+
+	// A pending body lives in the pending set until the flusher writes its
+	// blob; the stored object stays body-less, as with an on-disk body.
+	if pending {
+		s.stageBlob(bodyRef, data)
+		obj.Body = nil
 	}
 
 	if metadata != nil {
@@ -679,8 +987,21 @@ func applySSEMetadata(obj *Object, metadata map[string]string) {
 	delete(metadata, "x-amz-server-side-encryption-aws-kms-key-id")
 }
 
-// GetObject retrieves an object.
-func (s *MemoryStorage) GetObject(_ context.Context, bucket, key string) (*Object, error) {
+// GetObject retrieves an object. Its body is read from disk after the lock is
+// released; a referenced blob is only pruned at startup or Close, so it cannot
+// vanish underneath the read.
+func (s *MemoryStorage) GetObject(ctx context.Context, bucket, key string) (*Object, error) {
+	obj, err := s.getObject(ctx, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.objectWithBody(obj)
+}
+
+// getObject looks up the current version of an object under the read lock,
+// without its body.
+func (s *MemoryStorage) getObject(_ context.Context, bucket, key string) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -698,11 +1019,23 @@ func (s *MemoryStorage) GetObject(_ context.Context, bucket, key string) (*Objec
 		return nil, &ObjectError{Code: errCodeNoSuchKey, Message: msgKeyNotExist, Key: key}
 	}
 
+	return obj, nil
+}
+
+// GetObjectVersion retrieves a specific version of an object, its body read
+// from disk after the lock is released (see GetObject).
+func (s *MemoryStorage) GetObjectVersion(ctx context.Context, bucket, key, versionID string) (*Object, error) {
+	obj, err := s.getObjectVersion(ctx, bucket, key, versionID)
+	if err != nil {
+		return nil, err
+	}
+
 	return s.objectWithBody(obj)
 }
 
-// GetObjectVersion retrieves a specific version of an object.
-func (s *MemoryStorage) GetObjectVersion(_ context.Context, bucket, key, versionID string) (*Object, error) {
+// getObjectVersion looks up one version of an object under the read lock,
+// without its body.
+func (s *MemoryStorage) getObjectVersion(_ context.Context, bucket, key, versionID string) (*Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -718,7 +1051,7 @@ func (s *MemoryStorage) GetObjectVersion(_ context.Context, bucket, key, version
 				return nil, &ObjectError{Code: "MethodNotAllowed", Message: "The specified method is not allowed against this resource.", Key: key}
 			}
 
-			return s.objectWithBody(obj)
+			return obj, nil
 		}
 	}
 
@@ -801,6 +1134,9 @@ func (s *MemoryStorage) DeleteObject(_ context.Context, bucket, key string) (*Ob
 	// For non-versioned or suspended buckets, just delete
 	delete(b.Objects, key)
 
+	// The removed body may be an orphan now; the next flush prunes it.
+	s.orphans = true
+
 	// For suspended buckets, also remove "null" version
 	if b.VersioningStatus == VersioningSuspended {
 		versions := b.Versions[key]
@@ -851,6 +1187,9 @@ func (s *MemoryStorage) DeleteObjectVersion(_ context.Context, bucket, key, vers
 		// Update current object to the newest version
 		b.Objects[key] = newVersions[0]
 	}
+
+	// The removed version's body may be an orphan now; the next flush prunes it.
+	s.orphans = true
 
 	s.saveLocked()
 
@@ -1195,6 +1534,10 @@ func (s *MemoryStorage) CreateMultipartUpload(_ context.Context, bucket, key str
 
 // UploadPart uploads a part of a multipart upload.
 func (s *MemoryStorage) UploadPart(_ context.Context, bucket, key, uploadID string, partNumber int, body io.Reader) (*Part, error) {
+	// The part blob is written here; keep the prune out until it is recorded.
+	s.blobMu.RLock()
+	defer s.blobMu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1239,6 +1582,10 @@ func (s *MemoryStorage) UploadPart(_ context.Context, bucket, key, uploadID stri
 // in-progress multipart upload. RFC-equivalent: AWS S3 UploadPartCopy.
 // `copyRange` may be nil to copy the entire source object.
 func (s *MemoryStorage) UploadPartCopy(_ context.Context, dstBucket, dstKey, uploadID string, partNumber int, srcBucket, srcKey, srcVersionID string, copyRange *CopyRange) (*Part, error) {
+	// The part blob is written here; keep the prune out until it is recorded.
+	s.blobMu.RLock()
+	defer s.blobMu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1336,6 +1683,11 @@ func (s *MemoryStorage) CompleteMultipartUpload(ctx context.Context, bucket, key
 // (it's deleted only after a successful complete) so the caller can
 // retry.
 func (s *MemoryStorage) CompleteMultipartUploadIf(_ context.Context, bucket, key, uploadID string, parts []PartRequest, cond PutCondition) (*Object, error) {
+	// The combined blob is written here; keep the prune out until the object
+	// is inserted.
+	s.blobMu.RLock()
+	defer s.blobMu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1387,6 +1739,9 @@ func (s *MemoryStorage) CompleteMultipartUploadIf(_ context.Context, bucket, key
 
 	b.Objects[key] = obj
 	delete(b.MultipartUploads, uploadID)
+
+	// The part blobs are orphans now; the next flush prunes them.
+	s.orphans = true
 
 	s.saveLocked()
 
@@ -1499,6 +1854,9 @@ func (s *MemoryStorage) AbortMultipartUpload(_ context.Context, bucket, key, upl
 	}
 
 	delete(b.MultipartUploads, uploadID)
+
+	// The aborted part blobs are orphans now; the next flush prunes them.
+	s.orphans = true
 
 	s.saveLocked()
 

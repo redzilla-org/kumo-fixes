@@ -99,6 +99,12 @@ func TestMemoryStorage_PersistentPutKeepsBodyOnDisk(t *testing.T) {
 		t.Fatalf("stored object retained %d body bytes", len(stored.Body))
 	}
 
+	// A PUT is acknowledged before its body reaches disk; the background
+	// flush writes the blob.
+	if err := s.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
 	bodyOnDisk, err := os.ReadFile(blobPath(dir, bodyRefOf(body)))
 	if err != nil {
 		t.Fatalf("read blob: %v", err)

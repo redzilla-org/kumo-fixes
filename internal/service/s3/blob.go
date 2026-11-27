@@ -135,17 +135,20 @@ func readBlob(dataDir, ref string) ([]byte, error) {
 	return data, nil
 }
 
-// gcBlobs removes blob files no longer referenced by any object. It is
-// best-effort: a removal failure is ignored so a transient FS error never fails
-// a snapshot. referenced holds every live bodyRef; any other file in the objects
-// directory is an orphan from an overwritten or deleted object.
-func gcBlobs(dataDir string, referenced map[string]struct{}) {
+// gcBlobs removes blob files no longer referenced by any object and returns how
+// many it removed. It is best-effort: a removal failure is ignored so a
+// transient FS error never fails a flush. referenced holds every live bodyRef;
+// any other file in the objects directory is an orphan from an overwritten or
+// deleted object, or a leftover temporary file.
+func gcBlobs(dataDir string, referenced map[string]struct{}) int {
 	dir := filepath.Join(dataDir, objectsDir)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return 0
 	}
+
+	removed := 0
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -157,6 +160,10 @@ func gcBlobs(dataDir string, referenced map[string]struct{}) {
 			continue
 		}
 
-		_ = os.Remove(filepath.Join(dir, name))
+		if os.Remove(filepath.Join(dir, name)) == nil {
+			removed++
+		}
 	}
+
+	return removed
 }
