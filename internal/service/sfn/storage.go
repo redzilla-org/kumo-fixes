@@ -36,6 +36,7 @@ const (
 type Storage interface {
 	// State machine operations.
 	CreateStateMachine(ctx context.Context, req *CreateStateMachineRequest) (*StateMachine, error)
+	UpdateStateMachine(ctx context.Context, req *UpdateStateMachineRequest) (*UpdateStateMachineResponse, error)
 	DeleteStateMachine(ctx context.Context, arn string) error
 	DescribeStateMachine(ctx context.Context, arn string) (*StateMachine, error)
 	ListStateMachines(ctx context.Context, maxResults int32, nextToken string) ([]*StateMachine, string, error)

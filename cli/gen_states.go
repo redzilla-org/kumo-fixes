@@ -44,6 +44,7 @@ func newSFNCmd() *cobra.Command {
 		newSFNStopExecutionCmd(),
 		newSFNTagResourceCmd(),
 		newSFNUntagResourceCmd(),
+		newSFNUpdateStateMachineCmd(),
 		newSFNValidateStateMachineDefinitionCmd(),
 	)
 
@@ -1337,6 +1338,107 @@ func newSFNUntagResourceCmd() *cobra.Command {
 	cmd.Flags().StringVar(&resourceArn, "resource-arn", "", "Resource arn")
 
 	cmd.Flags().StringArrayVar(&tagKeys, "tag-keys", nil, "Tag keys")
+
+	cmd.Flags().String("region", "", "Region override (ignored)")
+
+	return cmd
+}
+
+func newSFNUpdateStateMachineCmd() *cobra.Command {
+	var stateMachineArn string
+	var definition string
+	var encryptionConfiguration string
+	var loggingConfiguration string
+	var publish bool
+	var roleArn string
+	var tracingConfiguration string
+	var versionDescription string
+
+	cmd := &cobra.Command{
+		Use:   "update-state-machine",
+		Short: "UpdateStateMachine",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := newAWSConfig(cmd.Context())
+			if err != nil {
+				return err
+			}
+
+			client := sfn.NewFromConfig(cfg, func(o *sfn.Options) {
+				o.BaseEndpoint = aws.String(endpointURL)
+			})
+
+			input := &sfn.UpdateStateMachineInput{}
+
+			if stateMachineArn != "" {
+				input.StateMachineArn = aws.String(stateMachineArn)
+			}
+
+			if definition != "" {
+				input.Definition = aws.String(definition)
+			}
+
+			if encryptionConfiguration != "" {
+				var val types.EncryptionConfiguration
+				if err := cligen.SetFieldsFromKV(reflect.ValueOf(&val).Elem(), encryptionConfiguration); err != nil {
+					return fmt.Errorf("update-state-machine: parse --encryption-configuration: %w", err)
+				}
+				input.EncryptionConfiguration = &val
+			}
+
+			if loggingConfiguration != "" {
+				if err := json.Unmarshal([]byte(loggingConfiguration), &input.LoggingConfiguration); err != nil {
+					return fmt.Errorf("update-state-machine: parse --logging-configuration: %w", err)
+				}
+			}
+
+			if publish {
+				input.Publish = publish
+			}
+
+			if roleArn != "" {
+				input.RoleArn = aws.String(roleArn)
+			}
+
+			if tracingConfiguration != "" {
+				var val types.TracingConfiguration
+				if err := cligen.SetFieldsFromKV(reflect.ValueOf(&val).Elem(), tracingConfiguration); err != nil {
+					return fmt.Errorf("update-state-machine: parse --tracing-configuration: %w", err)
+				}
+				input.TracingConfiguration = &val
+			}
+
+			if versionDescription != "" {
+				input.VersionDescription = aws.String(versionDescription)
+			}
+
+			out, err := client.UpdateStateMachine(cmd.Context(), input)
+			if err != nil {
+				return fmt.Errorf("update-state-machine failed: %w", err)
+			}
+
+			if err := writeOutput(out); err != nil {
+				return err
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&stateMachineArn, "state-machine-arn", "", "State machine arn")
+
+	cmd.Flags().StringVar(&definition, "definition", "", "Definition")
+
+	cmd.Flags().StringVar(&encryptionConfiguration, "encryption-configuration", "", "Encryption configuration (key=value,key2=value2)")
+
+	cmd.Flags().StringVar(&loggingConfiguration, "logging-configuration", "", "Logging configuration (JSON)")
+
+	cmd.Flags().BoolVar(&publish, "publish", false, "Publish")
+
+	cmd.Flags().StringVar(&roleArn, "role-arn", "", "Role arn")
+
+	cmd.Flags().StringVar(&tracingConfiguration, "tracing-configuration", "", "Tracing configuration (key=value,key2=value2)")
+
+	cmd.Flags().StringVar(&versionDescription, "version-description", "", "Version description")
 
 	cmd.Flags().String("region", "", "Region override (ignored)")
 

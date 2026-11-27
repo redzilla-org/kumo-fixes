@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/sivchari/kumo/internal/service/lambda"
 )
@@ -135,4 +137,59 @@ func TestLambdaWorkflowPreservesContextAndOrderedResults(t *testing.T) {
 			t.Fatalf("reverse=%v paged IDs=%v, want %v", reverse, ids, wantIDs)
 		}
 	}
+}
+
+// Updating a deployed definition must not change an in-flight
+// execution, and StopExecution must survive completion of its former Wait.
+func TestUpdateAndStopKeepExecutionIdentity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := NewMemoryStorage()
+		old := `{"StartAt":"Wait","States":{"Wait":{"Type":"Wait","Seconds":5,"Next":"Done"},"Done":{"Type":"Pass","Result":{"revision":"old"},"End":true}}}`
+		sm := createExecutionTestStateMachine(t, store, "update-in-flight", old)
+		started, err := store.StartExecution(t.Context(), sm.StateMachineArn, "in-flight", `{}`, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		_, err = store.UpdateStateMachine(t.Context(), &UpdateStateMachineRequest{
+			StateMachineArn: sm.StateMachineArn,
+			Definition:      `{"StartAt":"Done","States":{"Done":{"Type":"Pass","Result":{"revision":"new"},"End":true}}}`,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		latest := startAndAwaitSuccess(t, store, sm.StateMachineArn, `{}`)
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		prior, err := store.DescribeExecution(t.Context(), started.ExecutionArn)
+		if err != nil || prior.Status != ExecutionStatusSucceeded || prior.Output != `{"revision":"old"}` || latest.Output != `{"revision":"new"}` {
+			t.Fatalf("old=%+v new=%+v err=%v", prior, latest, err)
+		}
+		// Both completed executions must begin at event one, not a global counter.
+		for _, execution := range []*Execution{prior, latest} {
+			events, _, err := store.GetExecutionHistory(t.Context(), execution.ExecutionArn, 1, "", false)
+			if err != nil || len(events) != 1 || events[0].ID != 1 || events[0].Type != HistoryEventTypeExecutionStarted {
+				t.Fatalf("execution=%s first history=%+v err=%v", execution.ExecutionArn, events, err)
+			}
+		}
+		waiter := createExecutionTestStateMachine(t, store, "stop-in-flight", old)
+		stopped, err := store.StartExecution(t.Context(), waiter.StateMachineArn, "user-stop", `{}`, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if _, err := store.StopExecution(t.Context(), stopped.ExecutionArn, "UserStopped", "build superseded"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(6 * time.Second)
+		synctest.Wait()
+		stopped, err = store.DescribeExecution(t.Context(), stopped.ExecutionArn)
+		if err != nil || stopped.Status != ExecutionStatusAborted || stopped.Error != "UserStopped" || stopped.Cause != "build superseded" {
+			t.Fatalf("stopped=%+v err=%v", stopped, err)
+		}
+		events, _, err := store.GetExecutionHistory(t.Context(), stopped.ExecutionArn, 100, "", false)
+		if err != nil || events[len(events)-1].Type != HistoryEventTypeExecutionAborted {
+			t.Fatalf("history after StopExecution=%+v err=%v", events, err)
+		}
+	})
 }
