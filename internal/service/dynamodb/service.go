@@ -34,6 +34,11 @@ func New(storage Storage) *Service {
 	}
 }
 
+// Storage returns the backing store so CloudFormation can create stack tables in-process.
+func (s *Service) Storage() Storage {
+	return s.storage
+}
+
 // Name returns the service name.
 func (s *Service) Name() string {
 	return "dynamodb"
