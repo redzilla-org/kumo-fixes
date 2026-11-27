@@ -233,15 +233,113 @@ func recordSize(key string, data []byte) int64 {
 	return int64(1 + 2*binary.MaxVarintLen32 + len(key) + len(data))
 }
 
+// partIndex resolves Query's partition-key equality without walking the table:
+// partition attribute name (table/GSI/LSI HASH) -> kind+value
+// -> set of row keys. The row keys share the Items map keys' bytes, so the index
+// holds references, never row copies. Rows lacking a scalar value stay out,
+// matching DynamoDB's sparse indexes.
+type partIndex map[string]map[string]map[string]struct{}
+
+// partValueKey is the index key for a scalar partition value of the given kind.
+func partValueKey(kind byte, val string) string {
+	return string(kind) + val
+}
+
+// queryPartKey maps a queried partition value to its index key; ok is false
+// for a non-scalar value, which the caller answers with a full walk.
+func queryPartKey(av *AttributeValue) (string, bool) {
+	kind := scalarKind(av)
+	if kind == 0 {
+		return "", false
+	}
+
+	return partValueKey(kind, scalarValue(kind, av)), true
+}
+
+// buildPartIndex (re)indexes every row under every HASH attribute of the table
+// and its indexes. Called on create, after load and after reprojection.
+func (td *tableData) buildPartIndex() {
+	td.partIdx = partIndex{}
+
+	add := func(ks []KeySchemaElement) {
+		if name := keyAttrName(ks, "HASH"); name != "" {
+			td.partIdx[name] = map[string]map[string]struct{}{}
+		}
+	}
+
+	add(td.Table.KeySchema)
+
+	for _, gsi := range td.Table.GlobalSecondaryIndexes {
+		add(gsi.KeySchema)
+	}
+
+	for _, lsi := range td.Table.LocalSecondaryIndexes {
+		add(lsi.KeySchema)
+	}
+
+	for key, si := range td.Items {
+		td.indexRow(key, &si, true)
+	}
+}
+
+// indexRow adds or removes one row under each indexed partition attribute it
+// carries. A table without an index (nil partIdx) is left alone.
+func (td *tableData) indexRow(key string, si *storedItem, add bool) {
+	for i := range si.proj {
+		p := &si.proj[i]
+
+		parts, ok := td.partIdx[p.name]
+		if !ok {
+			continue
+		}
+
+		vk := partValueKey(p.kind, p.val)
+
+		if add {
+			if parts[vk] == nil {
+				parts[vk] = map[string]struct{}{}
+			}
+
+			parts[vk][key] = struct{}{}
+
+			continue
+		}
+
+		delete(parts[vk], key)
+
+		if len(parts[vk]) == 0 {
+			delete(parts, vk)
+		}
+	}
+}
+
+// partitionRows returns the row keys of one partition; ok is false when the
+// attribute or value is not indexed and the caller must walk every row.
+func (td *tableData) partitionRows(name string, want *AttributeValue) (map[string]struct{}, bool) {
+	parts, ok := td.partIdx[name]
+	if !ok {
+		return nil, false
+	}
+
+	vk, ok := queryPartKey(want)
+	if !ok {
+		return nil, false
+	}
+
+	return parts[vk], true
+}
+
 // putStoredLocked stores item under key, projecting the table's hot
 // attributes and journaling the write for persistence. Caller holds m.mu.
 func (m *MemoryStorage) putStoredLocked(td *tableData, key string, item Item) {
 	if old, ok := td.Items[key]; ok {
 		td.liveBytes -= recordSize(key, old.data)
+		td.indexRow(key, &old, false)
 	}
 
 	si := newStoredItem(td.projNames, item)
 	td.Items[key] = si
+	td.indexRow(key, &si, true)
 	td.liveBytes += recordSize(key, si.data)
 
 	if m.dataDir != "" {
@@ -257,6 +355,7 @@ func (m *MemoryStorage) deleteStoredLocked(td *tableData, key string) {
 	}
 
 	td.liveBytes -= recordSize(key, old.data)
+	td.indexRow(key, &old, false)
 	delete(td.Items, key)
 
 	if m.dataDir != "" {
@@ -286,6 +385,9 @@ func (td *tableData) reprojectAll() error {
 
 		td.Items[key] = si
 	}
+
+	// Projections changed, so the partition index is rebuilt from them.
+	td.buildPartIndex()
 
 	return nil
 }
