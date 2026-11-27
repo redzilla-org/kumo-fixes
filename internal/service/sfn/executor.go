@@ -623,6 +623,15 @@ func resolveJSONPathRef(key string, value any, input string, inputData any, cont
 	if !ok {
 		return nil, inputData, fmt.Errorf("jsonPath reference for key %q must be a string", key)
 	}
+	if strings.HasPrefix(pathStr, "States.") {
+		if inputData == nil {
+			if err := json.Unmarshal([]byte(input), &inputData); err != nil {
+				return nil, inputData, fmt.Errorf("parse intrinsic input: %w", err)
+			}
+		}
+		value, err := resolveIntrinsic(pathStr, inputData, contextData, 1)
+		return value, inputData, err
+	}
 
 	if strings.HasPrefix(pathStr, "$$.") {
 		if contextData == nil {
