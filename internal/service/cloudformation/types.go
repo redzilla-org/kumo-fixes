@@ -51,6 +51,9 @@ type StackResource struct {
 	StackID            string
 	StackName          string
 	Properties         map[string]any
+	// Materialization records whether the resource exists in a service store
+	// ("MATERIALIZED") or is a stack record only ("TRACKED_INERT").
+	Materialization string
 }
 
 // TemplateValidationResult represents the result of template validation.
@@ -253,9 +256,11 @@ type XMLStackResource struct {
 	PhysicalResourceID string `xml:"PhysicalResourceId"`
 	ResourceType       string `xml:"ResourceType"`
 	ResourceStatus     string `xml:"ResourceStatus"`
-	Timestamp          string `xml:"Timestamp"`
-	StackID            string `xml:"StackId"`
-	StackName          string `xml:"StackName"`
+	// Carries the Materialization marker; SDKs already surface this field.
+	ResourceStatusReason string `xml:"ResourceStatusReason,omitempty"`
+	Timestamp            string `xml:"Timestamp"`
+	StackID              string `xml:"StackId"`
+	StackName            string `xml:"StackName"`
 }
 
 // XMLGetTemplateResponse is the XML response for GetTemplate.

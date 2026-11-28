@@ -18,6 +18,12 @@ func Services() []Service {
 	return globalRegistry.All()
 }
 
+// Get returns a service from the global registry by name, so one service
+// (for example CloudFormation) can reach a sibling's store in-process.
+func Get(name string) (Service, bool) {
+	return globalRegistry.Get(name)
+}
+
 // Registry manages service registration and discovery.
 type Registry struct {
 	mu       sync.RWMutex

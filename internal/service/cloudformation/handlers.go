@@ -37,7 +37,8 @@ func (s *Service) CreateStack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stack, err := s.storage.CreateStack(r.Context(), &req)
+	// ${AWS::Region} resolves against this instance's region, or the caller's signing region.
+	stack, err := s.storage.CreateStack(withStackRegion(r.Context(), resolveRegion(r)), &req)
 	if err != nil {
 		handleCFNError(w, err)
 
@@ -159,7 +160,7 @@ func (s *Service) UpdateStack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stack, err := s.storage.UpdateStack(r.Context(), &req)
+	stack, err := s.storage.UpdateStack(withStackRegion(r.Context(), resolveRegion(r)), &req)
 	if err != nil {
 		handleCFNError(w, err)
 
@@ -375,13 +376,14 @@ func convertToXMLStackSummary(stack *Stack) XMLStackSummary {
 // convertToXMLStackResource converts a StackResource to XMLStackResource.
 func convertToXMLStackResource(resource *StackResource) XMLStackResource {
 	return XMLStackResource{
-		LogicalResourceID:  resource.LogicalResourceID,
-		PhysicalResourceID: resource.PhysicalResourceID,
-		ResourceType:       resource.ResourceType,
-		ResourceStatus:     resource.ResourceStatus,
-		Timestamp:          resource.Timestamp.Format("2006-01-02T15:04:05.000Z"),
-		StackID:            resource.StackID,
-		StackName:          resource.StackName,
+		LogicalResourceID:    resource.LogicalResourceID,
+		PhysicalResourceID:   resource.PhysicalResourceID,
+		ResourceType:         resource.ResourceType,
+		ResourceStatus:       resource.ResourceStatus,
+		ResourceStatusReason: resource.Materialization,
+		Timestamp:            resource.Timestamp.Format("2006-01-02T15:04:05.000Z"),
+		StackID:              resource.StackID,
+		StackName:            resource.StackName,
 	}
 }
 

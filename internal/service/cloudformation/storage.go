@@ -3,6 +3,7 @@ package cloudformation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -157,8 +158,16 @@ func (m *MemoryStorage) CreateStack(ctx context.Context, req *CreateStackRequest
 		Resources:       resources,
 	}
 
+	if err := checkResourceTypes(stack); err != nil {
+		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
+	markInertResources(stack)
 	if err := provisionStackS3(ctx, stack, nil); err != nil {
 		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
+	// A failed table or parameter must not leave the stack's buckets behind.
+	if err := provisionStackResources(ctx, stack); err != nil {
+		return nil, &Error{Code: errInvalidParameter, Message: errors.Join(err, deleteStackS3(ctx, stack)).Error()}
 	}
 	m.Stacks[req.StackName] = stack
 
@@ -177,6 +186,9 @@ func (m *MemoryStorage) DeleteStack(ctx context.Context, stackName string) error
 		return &Error{Code: errStackNotFound, Message: msgStackNotFound}
 	}
 
+	if err := deleteStackResources(ctx, stack); err != nil {
+		return &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
 	if err := deleteStackS3(ctx, stack); err != nil {
 		return &Error{Code: errInvalidParameter, Message: err.Error()}
 	}
