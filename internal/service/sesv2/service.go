@@ -60,6 +60,9 @@ func (s *Service) RegisterRoutes(r service.Router) {
 	r.HandleFunc("DELETE", "/ses/v2/email/templates/{templateName}", s.DeleteEmailTemplate)
 
 	// Send Email routes.
+	// Standard SDKs use the service-native path without Kumo's optional prefix.
+	r.HandleFunc("POST", "/v2/email/outbound-emails", s.SendEmail)
+	r.HandleFunc("POST", "/v2/email/outbound-bulk-emails", s.SendBulkEmail)
 	r.HandleFunc("POST", "/ses/v2/email/outbound-emails", s.SendEmail)
 	r.HandleFunc("POST", "/ses/v2/email/outbound-bulk-emails", s.SendBulkEmail)
 

@@ -2,6 +2,7 @@ package ses
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -10,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/mail"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -235,7 +237,7 @@ func (s *Service) GetIdentityVerificationAttributes(w http.ResponseWriter, r *ht
 }
 
 // GetMailbox handles the kumo-specific mailbox endpoint.
-// This returns all sent emails for a given sender, exposed at /_aws/ses?email=...
+// This returns messages addressed to or sent by the selected mailbox address.
 func (s *Service) GetMailbox(w http.ResponseWriter, r *http.Request) {
 	email := r.URL.Query().Get("email")
 	if email == "" {
@@ -249,6 +251,27 @@ func (s *Service) GetMailbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	emails, err := s.storage.GetMailbox(r.Context(), email)
+	// Other SES APIs retain their own storage; project their records at read time.
+	if err == nil {
+		for _, svc := range service.Services() {
+			provider, ok := svc.(interface {
+				Mailbox(context.Context, string) ([]*SentEmail, error)
+			})
+			if !ok {
+				continue
+			}
+
+			var more []*SentEmail
+			more, err = provider.Mailbox(r.Context(), email)
+
+			if err != nil {
+				break
+			}
+
+			emails = append(emails, more...)
+		}
+	}
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -259,6 +282,7 @@ func (s *Service) GetMailbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sort.SliceStable(emails, func(i, j int) bool { return emails[i].SentAt.Before(emails[j].SentAt) })
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(emails)
