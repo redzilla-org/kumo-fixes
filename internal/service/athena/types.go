@@ -174,6 +174,7 @@ type Row struct {
 // Datum represents a single data value.
 type Datum struct {
 	VarCharValue string
+	Null         bool
 }
 
 // ResultSetMetadata represents result set metadata.
@@ -333,7 +334,7 @@ type RowOutput struct {
 
 // DatumOutput represents a datum in API response.
 type DatumOutput struct {
-	VarCharValue string `json:"VarCharValue,omitempty"`
+	VarCharValue *string `json:"VarCharValue,omitempty"`
 }
 
 // ResultSetMetadataOutput represents result set metadata in API response.
