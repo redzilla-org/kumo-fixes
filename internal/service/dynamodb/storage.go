@@ -97,6 +97,8 @@ type tableData struct {
 	Items map[string]storedItem `json:"items"`
 	// projNames are the attributes projected out of every row (keys, TTL).
 	projNames []string
+	// partIdx lets Query visit only the queried partition (see partIndex).
+	partIdx partIndex
 	// fileID names this table's append-only log under dynamodb.d/.
 	fileID string
 	// pending holds journal records written since the last flush.
@@ -347,13 +349,16 @@ func (m *MemoryStorage) CreateTable(_ context.Context, req *CreateTableRequest) 
 	m.setupTableStream(table, req)
 
 	// A new table gets its own log file; needCompact writes its header.
-	m.Tables[req.TableName] = &tableData{
+	td := &tableData{
 		Table:       table,
 		Items:       make(map[string]storedItem),
 		projNames:   projectedNames(table),
 		fileID:      newTableFileID(),
 		needCompact: true,
 	}
+	// Empty index shaped by the key schema; writes keep it current.
+	td.buildPartIndex()
+	m.Tables[req.TableName] = td
 
 	if len(req.Tags) > 0 {
 		m.Tags[table.TableARN] = req.Tags
@@ -837,7 +842,7 @@ func (m *MemoryStorage) Query(_ context.Context, tableName, indexName, keyCondEx
 		return nil, nil, 0, err
 	}
 
-	candidates, err := m.queryMatchingItems(td.Items, partitionKeyName, partitionKeyValue, resolvedKeyCondExpr, exprValues)
+	candidates, err := m.queryMatchingItems(td, partitionKeyName, partitionKeyValue, resolvedKeyCondExpr, exprValues)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -913,15 +918,38 @@ func projectedPartitionMatch(si *storedItem, name string, want *AttributeValue) 
 	return false, si.projComplete
 }
 
-// queryMatchingItems walks the table's rows and returns those that match the
-// partition key and the full key condition, in table order. Filtering and
-// Limit are applied afterward, once the candidates are sorted by sort key and
-// positioned past ExclusiveStartKey, so that Limit bounds evaluated items
-// rather than post-filter matches (see evaluatePage).
-func (m *MemoryStorage) queryMatchingItems(items map[string]storedItem, partitionKeyName string, partitionKeyValue *AttributeValue, resolvedKeyCondExpr string, exprValues map[string]AttributeValue) ([]rowRef, error) {
+// queryMatchingItems returns the rows that match the partition key and the
+// full key condition, in table order. The partition index narrows the visit to
+// the queried partition; only an unindexed or absent
+// partition value walks every row. Filtering and Limit are applied afterward,
+// once the candidates are sorted by sort key and positioned past
+// ExclusiveStartKey, so that Limit bounds evaluated items rather than
+// post-filter matches (see evaluatePage).
+func (m *MemoryStorage) queryMatchingItems(td *tableData, partitionKeyName string, partitionKeyValue *AttributeValue, resolvedKeyCondExpr string, exprValues map[string]AttributeValue) ([]rowRef, error) {
 	var candidates []rowRef
 
-	for key, si := range items {
+	// Default to every row; the index replaces it with one partition's rows.
+	visit := func(yield func(string, storedItem) bool) {
+		for key, si := range td.Items {
+			if !yield(key, si) {
+				return
+			}
+		}
+	}
+
+	if partitionKeyValue != nil {
+		if keys, ok := td.partitionRows(partitionKeyName, partitionKeyValue); ok {
+			visit = func(yield func(string, storedItem) bool) {
+				for key := range keys {
+					if !yield(key, td.Items[key]) {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	for key, si := range visit {
 		var full Item
 
 		if partitionKeyValue != nil {

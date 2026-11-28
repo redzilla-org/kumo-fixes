@@ -348,6 +348,8 @@ func (m *MemoryStorage) loadPersisted() error {
 			defer wg.Done()
 
 			size, err := replayLog(filepath.Join(dir, td.fileID), td)
+			// Index the replayed rows once, instead of per replayed record.
+			td.buildPartIndex()
 			errMu.Lock()
 			defer errMu.Unlock()
 
