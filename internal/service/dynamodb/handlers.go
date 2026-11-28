@@ -348,6 +348,15 @@ func (s *Service) Query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Select=COUNT returns the counts and NO items, as DynamoDB does. Ignoring
+	// it serialized every matching full row, so a count over a large partition
+	// answered with a multi-megabyte body that could outrun a caller's deadline.
+	if req.Select == selectCount {
+		writeJSONResponse(w, countResponse{Count: len(items), ScannedCount: scannedCount, LastEvaluatedKey: lastKey})
+
+		return
+	}
+
 	items = projectItemsForExpression(items, req.ProjectionExpression, req.ExpressionAttributeNames)
 
 	writeJSONResponse(w, QueryResponse{
@@ -389,6 +398,13 @@ func (s *Service) Scan(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeDynamoDBError(w, "InternalServerError", "Internal server error", http.StatusInternalServerError)
+
+		return
+	}
+
+	// Select=COUNT: counts only, no items (same rule as Query).
+	if req.Select == selectCount {
+		writeJSONResponse(w, countResponse{Count: len(items), ScannedCount: scannedCount, LastEvaluatedKey: lastKey})
 
 		return
 	}
