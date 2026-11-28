@@ -122,7 +122,7 @@ func (m *MemoryStorage) Close() error {
 }
 
 // CreateStack creates a new stack.
-func (m *MemoryStorage) CreateStack(_ context.Context, req *CreateStackRequest) (*Stack, error) {
+func (m *MemoryStorage) CreateStack(ctx context.Context, req *CreateStackRequest) (*Stack, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -157,6 +157,9 @@ func (m *MemoryStorage) CreateStack(_ context.Context, req *CreateStackRequest) 
 		Resources:       resources,
 	}
 
+	if err := provisionStackS3(ctx, stack, nil); err != nil {
+		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
 	m.Stacks[req.StackName] = stack
 
 	m.saveLocked()
@@ -165,7 +168,7 @@ func (m *MemoryStorage) CreateStack(_ context.Context, req *CreateStackRequest) 
 }
 
 // DeleteStack deletes a stack.
-func (m *MemoryStorage) DeleteStack(_ context.Context, stackName string) error {
+func (m *MemoryStorage) DeleteStack(ctx context.Context, stackName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -174,6 +177,9 @@ func (m *MemoryStorage) DeleteStack(_ context.Context, stackName string) error {
 		return &Error{Code: errStackNotFound, Message: msgStackNotFound}
 	}
 
+	if err := deleteStackS3(ctx, stack); err != nil {
+		return &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
 	stack.StackStatus = StackStatusDeleteComplete
 	stack.DeletionTime = time.Now()
 
@@ -228,7 +234,7 @@ func (m *MemoryStorage) ListStacks(_ context.Context, statusFilter []string) ([]
 }
 
 // UpdateStack updates a stack.
-func (m *MemoryStorage) UpdateStack(_ context.Context, req *UpdateStackRequest) (*Stack, error) {
+func (m *MemoryStorage) UpdateStack(ctx context.Context, req *UpdateStackRequest) (*Stack, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -252,12 +258,17 @@ func (m *MemoryStorage) UpdateStack(_ context.Context, req *UpdateStackRequest) 
 	}
 
 	now := time.Now()
-	stack.TemplateBody = req.TemplateBody
-	stack.LastUpdatedTime = now
-	stack.StackStatus = StackStatusUpdateComplete
+	updated := *stack
+	updated.TemplateBody = req.TemplateBody
+	updated.LastUpdatedTime = now
+	updated.StackStatus = StackStatusUpdateComplete
 
-	stack.Parameters = parameters
-	stack.Resources = resources
+	updated.Parameters = parameters
+	updated.Resources = resources
+	if err := provisionStackS3(ctx, &updated, stack); err != nil {
+		return nil, &Error{Code: errInvalidParameter, Message: err.Error()}
+	}
+	*stack = updated
 
 	m.saveLocked()
 
