@@ -332,7 +332,7 @@ func (m *MemoryStorage) DeleteTable(_ context.Context, tableName string) (*Table
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -343,7 +343,7 @@ func (m *MemoryStorage) DeleteTable(_ context.Context, tableName string) (*Table
 	table := td.Table
 	table.TableStatus = "DELETING"
 
-	delete(m.Tables, tableName)
+	delete(m.Tables, tableNameFromIdentifier(tableName))
 
 	m.saveLocked()
 
@@ -398,7 +398,7 @@ func (m *MemoryStorage) DescribeTable(_ context.Context, tableName string) (*Tab
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -416,7 +416,7 @@ func (m *MemoryStorage) UpdateTable(_ context.Context, req *UpdateTableRequest) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	td, exists := m.Tables[req.TableName]
+	td, exists := m.tableByIdentifier(req.TableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -441,7 +441,7 @@ func (m *MemoryStorage) PutItem(_ context.Context, tableName string, item Item, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -494,20 +494,33 @@ func (m *MemoryStorage) PutItem(_ context.Context, tableName string, item Item, 
 	return oldItem, nil
 }
 
-// tableByIdentity accepts only the stored ARN, so another account or region cannot
-// address a local table merely by sharing its final resource name. Caller holds mu.
-func (m *MemoryStorage) tableByIdentity(identity string) (*tableData, bool) {
-	if td, ok := m.Tables[identity]; ok {
-		return td, true
+// tableByIdentifier accepts the table name or a DynamoDB table ARN on every
+// table API. A client that addresses tables by their real-account ARN and points
+// at this emulator through AWS_ENDPOINT_URL_DYNAMODB alone must reach the local
+// table, so the ARN resolves to its table name and account and region are
+// ignored; one emulator serves one endpoint. The caller holds m.mu.
+func (m *MemoryStorage) tableByIdentifier(identifier string) (*tableData, bool) {
+	td, exists := m.Tables[tableNameFromIdentifier(identifier)]
+
+	return td, exists
+}
+
+// tableNameFromIdentifier maps "arn:aws:dynamodb:<region>:<account>:table/<name>"
+// to <name>; a plain name passes through. A non-table ARN yields "", never a match.
+func tableNameFromIdentifier(identifier string) string {
+	if !strings.HasPrefix(identifier, "arn:") {
+		return identifier
 	}
 
-	for _, td := range m.Tables {
-		if td.Table.TableARN == identity {
-			return td, true
-		}
+	_, name, valid := strings.Cut(identifier, ":table/")
+	if !valid {
+		return ""
 	}
 
-	return nil, false
+	// Index/stream suffixes ("<name>/index/...") never name a table here.
+	name, _, _ = strings.Cut(name, "/")
+
+	return name
 }
 
 // GetItem gets an item from a table.
@@ -515,7 +528,7 @@ func (m *MemoryStorage) GetItem(_ context.Context, tableName string, key Item) (
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.tableByIdentity(tableName)
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -541,7 +554,7 @@ func (m *MemoryStorage) DeleteItem(_ context.Context, tableName string, key Item
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -596,7 +609,7 @@ func (m *MemoryStorage) UpdateItem(_ context.Context, tableName string, key Item
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -719,7 +732,7 @@ func (m *MemoryStorage) Query(_ context.Context, tableName, indexName, keyCondEx
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.tableByIdentity(tableName)
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, nil, 0, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -909,7 +922,7 @@ func (m *MemoryStorage) Scan(_ context.Context, tableName, filterExpr string, ex
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, nil, 0, &TableError{
 			Code:    errCodeResourceNotFound,
@@ -1968,7 +1981,7 @@ func (m *MemoryStorage) validateTransactWriteItem(twi TransactWriteItem) (*Cance
 
 // validateTransactPut validates a Put action's item key and condition.
 func (m *MemoryStorage) validateTransactPut(put *TransactPut) (*CancellationReason, error) {
-	td, exists := m.Tables[put.TableName]
+	td, exists := m.Tables[tableNameFromIdentifier(put.TableName)]
 	if !exists {
 		return nil, &TableError{Code: errCodeResourceNotFound, Message: fmt.Sprintf("Table: %s not found", put.TableName)}
 	}
@@ -1984,7 +1997,7 @@ func (m *MemoryStorage) validateTransactPut(put *TransactPut) (*CancellationReas
 
 // validateTransactDelete validates a Delete action's key and condition.
 func (m *MemoryStorage) validateTransactDelete(del *TransactDelete) (*CancellationReason, error) {
-	td, exists := m.Tables[del.TableName]
+	td, exists := m.Tables[tableNameFromIdentifier(del.TableName)]
 	if !exists {
 		return nil, &TableError{Code: errCodeResourceNotFound, Message: fmt.Sprintf("Table: %s not found", del.TableName)}
 	}
@@ -2000,7 +2013,7 @@ func (m *MemoryStorage) validateTransactDelete(del *TransactDelete) (*Cancellati
 
 // validateTransactUpdate validates an Update action's key, update expression, and condition.
 func (m *MemoryStorage) validateTransactUpdate(upd *TransactUpdate) (*CancellationReason, error) {
-	td, exists := m.Tables[upd.TableName]
+	td, exists := m.Tables[tableNameFromIdentifier(upd.TableName)]
 	if !exists {
 		return nil, &TableError{Code: errCodeResourceNotFound, Message: fmt.Sprintf("Table: %s not found", upd.TableName)}
 	}
@@ -2020,7 +2033,7 @@ func (m *MemoryStorage) validateTransactUpdate(upd *TransactUpdate) (*Cancellati
 
 // validateTransactConditionCheck validates a ConditionCheck action's key and condition.
 func (m *MemoryStorage) validateTransactConditionCheck(cc *TransactConditionCheck) (*CancellationReason, error) {
-	td, exists := m.Tables[cc.TableName]
+	td, exists := m.Tables[tableNameFromIdentifier(cc.TableName)]
 	if !exists {
 		return nil, &TableError{Code: errCodeResourceNotFound, Message: fmt.Sprintf("Table: %s not found", cc.TableName)}
 	}
@@ -2037,7 +2050,7 @@ func (m *MemoryStorage) validateTransactConditionCheck(cc *TransactConditionChec
 // checkTransactCondition checks a condition against the existing item in a table.
 // Must be called under lock.
 func (m *MemoryStorage) checkTransactCondition(tableName string, keyOrItem Item, cond ConditionInput) (*CancellationReason, error) {
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{Code: errCodeResourceNotFound, Message: fmt.Sprintf("Table: %s not found", tableName)}
 	}
@@ -2065,17 +2078,17 @@ func (m *MemoryStorage) checkTransactCondition(tableName string, keyOrItem Item,
 func (m *MemoryStorage) applyTransactWriteItem(twi TransactWriteItem) {
 	switch {
 	case twi.Put != nil:
-		td := m.Tables[twi.Put.TableName]
+		td := m.Tables[tableNameFromIdentifier(twi.Put.TableName)]
 		key := m.serializeKey(td.Table, twi.Put.Item)
 		td.Items[key] = m.copyItem(twi.Put.Item)
 
 	case twi.Delete != nil:
-		td := m.Tables[twi.Delete.TableName]
+		td := m.Tables[tableNameFromIdentifier(twi.Delete.TableName)]
 		key := m.serializeKey(td.Table, twi.Delete.Key)
 		delete(td.Items, key)
 
 	case twi.Update != nil:
-		td := m.Tables[twi.Update.TableName]
+		td := m.Tables[tableNameFromIdentifier(twi.Update.TableName)]
 		key := m.serializeKey(td.Table, twi.Update.Key)
 
 		item, ok := td.Items[key]
@@ -2104,7 +2117,7 @@ func (m *MemoryStorage) TransactGetItems(_ context.Context, items []TransactGetI
 			return nil, newValidationException("TransactGetItems member must contain Get")
 		}
 
-		td, exists := m.Tables[tgi.Get.TableName]
+		td, exists := m.Tables[tableNameFromIdentifier(tgi.Get.TableName)]
 		if !exists {
 			return nil, &TableError{
 				Code:    errCodeResourceNotFound,
@@ -2131,7 +2144,7 @@ func (m *MemoryStorage) BatchWriteItem(_ context.Context, requestItems map[strin
 	defer m.mu.Unlock()
 
 	for tableName, requests := range requestItems {
-		td, exists := m.Tables[tableName]
+		td, exists := m.tableByIdentifier(tableName)
 		if !exists {
 			return nil, &TableError{
 				Code:    errCodeResourceNotFound,
@@ -2190,7 +2203,7 @@ func (m *MemoryStorage) BatchGetItem(_ context.Context, requestItems map[string]
 	responses := make(map[string][]Item)
 
 	for tableName, ka := range requestItems {
-		td, exists := m.Tables[tableName]
+		td, exists := m.tableByIdentifier(tableName)
 		if !exists {
 			return nil, &TableError{
 				Code:    errCodeResourceNotFound,
@@ -2224,7 +2237,7 @@ func (m *MemoryStorage) UpdateTimeToLive(_ context.Context, tableName, attribute
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return &TableError{Code: errCodeResourceNotFound, Message: "Requested resource not found"}
 	}
@@ -2242,7 +2255,7 @@ func (m *MemoryStorage) DescribeTimeToLive(_ context.Context, tableName string) 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return "", false, &TableError{Code: errCodeResourceNotFound, Message: "Requested resource not found"}
 	}
@@ -2441,7 +2454,7 @@ func (m *MemoryStorage) DescribeContinuousBackups(_ context.Context, tableName s
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if _, exists := m.Tables[tableName]; !exists {
+	if _, exists := m.tableByIdentifier(tableName); !exists {
 		return nil, &TableError{
 			Code:    "TableNotFoundException",
 			Message: "Table not found: " + tableName,
