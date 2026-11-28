@@ -396,6 +396,11 @@ func readCFNJSONRequest(r *http.Request, v any) error {
 		return nil
 	}
 
+	body, err = normalizeParameterArray(body)
+	if err != nil {
+		return err
+	}
+
 	if err := json.Unmarshal(body, v); err != nil {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
