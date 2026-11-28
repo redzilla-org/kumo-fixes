@@ -203,12 +203,15 @@ func TestSFN_GetExecutionHistory(t *testing.T) {
 	startOutput, err := client.StartExecution(ctx, &sfn.StartExecutionInput{
 		StateMachineArn: createOutput.StateMachineArn,
 		Name:            aws.String("history-test-execution"),
+		Input:           aws.String(`{}`),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Get execution history.
+	// A completed Pass has entered/exited events between its execution events.
+	// Wait for terminal state so this assertion never snapshots a running history.
+	waitForSFNExecutionTerminal(t, client, *startOutput.ExecutionArn)
 	historyOutput, err := client.GetExecutionHistory(ctx, &sfn.GetExecutionHistoryInput{
 		ExecutionArn: startOutput.ExecutionArn,
 		MaxResults:   100,
@@ -216,7 +219,7 @@ func TestSFN_GetExecutionHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	golden.New(t, golden.WithIgnoreFields("Id", "Timestamp", "ResultMetadata")).Assert(t.Name(), historyOutput)
+	golden.New(t, golden.WithIgnoreFields("Timestamp", "ResultMetadata")).Assert(t.Name(), historyOutput)
 }
 
 func TestSFN_DeleteStateMachine(t *testing.T) {

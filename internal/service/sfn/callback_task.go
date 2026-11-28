@@ -47,25 +47,27 @@ func (e *executionEngine) executeCallbackTask(ctx context.Context, name string, 
 
 	token, pending := e.tokens.register()
 
-	params, err := resolveParametersWithContext(state.Parameters, input, taskTokenContext(token))
+	data := contextData(ctx)
+	data["Task"] = taskTokenContext(token)["Task"]
+	params, err := resolveParametersWithContext(state.Parameters, input, data)
 	if err != nil {
 		e.tokens.release(token)
 
 		return "", fmt.Errorf("resolve parameters: %w", err)
 	}
 
-	if err := e.fireCallbackIntegration(ctx, baseResource, params); err != nil {
-		e.tokens.release(token)
+	return recordTaskAttempt(ctx, state, params, input, func() (string, error) {
+		if err := e.fireCallbackIntegration(ctx, baseResource, params); err != nil {
+			e.tokens.release(token)
 
-		return "", err
-	}
+			return "", err
+		}
 
-	return e.awaitTaskToken(ctx, name, token, state, pending)
+		return e.awaitTaskToken(ctx, name, token, state, pending)
+	})
 }
 
-// taskTokenContext builds the $$.Task.Token Context object subset a
-// callback/activity Task state's Parameters may reference. kumo does not
-// model the rest of the Context object ($$.Execution, $$.State, ...).
+// taskTokenContext adds the token identity to a callback's execution context.
 func taskTokenContext(token string) map[string]any {
 	return map[string]any{
 		stateTypeTask: map[string]any{"Token": token},

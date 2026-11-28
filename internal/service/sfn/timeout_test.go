@@ -122,7 +122,7 @@ func TestTaskTimeoutCaughtByCatchRecoversExecution(t *testing.T) {
 	}
 }
 
-func TestDefinitionTimeoutSecondsFailsExecutionWithStatesTimeout(t *testing.T) {
+func TestDefinitionTimeoutSecondsMarksExecutionTimedOut(t *testing.T) {
 	t.Parallel()
 
 	definition := `{
@@ -136,7 +136,11 @@ func TestDefinitionTimeoutSecondsFailsExecutionWithStatesTimeout(t *testing.T) {
 	store := NewMemoryStorage()
 	sm := createExecutionTestStateMachine(t, store, "definition-timeout", definition)
 
-	exec := startAndAwaitFailure(t, store, sm.StateMachineArn, `{}`)
+	// ASL execution deadlines have their own terminal status, unlike task errors.
+	exec := startAndAwaitTerminal(t, store, sm.StateMachineArn, `{}`)
+	if exec.Status != ExecutionStatusTimedOut {
+		t.Fatalf("execution status: got %q, want TIMED_OUT", exec.Status)
+	}
 
 	if exec.Error != errorStatesTimeout {
 		t.Fatalf("execution error: got %q, want %q (cause: %s)", exec.Error, errorStatesTimeout, exec.Cause)
