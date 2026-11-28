@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -74,17 +75,25 @@ type MemoryStorage struct {
 	Subscriptions map[string]*Subscription `json:"subscriptions"`  // keyed by ARN
 	Tags          map[string][]Tag         `json:"tags,omitempty"` // keyed by resource ARN
 	baseURL       string
+	region        string
 	SqsPublisher  SQSPublisher `json:"-"`
 	dataDir       string
 }
 
 // NewMemoryStorage creates a new in-memory SNS storage.
 func NewMemoryStorage(baseURL string, opts ...Option) *MemoryStorage {
+	// Like Lambda, SNS uses the emulator instance's region, so instances
+	// configured for other regions do not mint hard-coded us-east-1 ARNs.
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		region = defaultRegion
+	}
 	s := &MemoryStorage{
 		Topics:        make(map[string]*Topic),
 		Subscriptions: make(map[string]*Subscription),
 		Tags:          make(map[string][]Tag),
 		baseURL:       baseURL,
+		region:        region,
 	}
 	for _, o := range opts {
 		o(s)
@@ -942,14 +951,11 @@ func isValidTopicName(name string) bool {
 
 // buildTopicARN builds an ARN for a topic.
 func (m *MemoryStorage) buildTopicARN(name string) string {
-	return fmt.Sprintf("arn:aws:sns:%s:%s:%s", defaultRegion, defaultAccountID, name)
+	return fmt.Sprintf("arn:aws:sns:%s:%s:%s", m.region, defaultAccountID, name)
 }
 
 // buildSubscriptionARN builds an ARN for a subscription.
 func (m *MemoryStorage) buildSubscriptionARN(topicARN string) string {
-	parts := strings.Split(topicARN, ":")
-	topicName := parts[len(parts)-1]
-
-	return fmt.Sprintf("arn:aws:sns:%s:%s:%s:%s",
-		defaultRegion, defaultAccountID, topicName, uuid.New().String())
+	// A subscription inherits its topic's complete identity, including region.
+	return topicARN + ":" + uuid.New().String()
 }
