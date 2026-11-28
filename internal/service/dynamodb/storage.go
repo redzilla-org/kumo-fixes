@@ -87,11 +87,31 @@ type MemoryStorage struct {
 	dataDir     string
 	stopTTL     chan struct{}
 	streamStore *streams.Store
+	persist     persistState
 }
 
+// tableData is one table's live state. Items hold compact encoded rows (see
+// item_store.go); the unexported fields drive incremental persistence.
 type tableData struct {
-	Table *Table          `json:"table"`
-	Items map[string]Item `json:"items"`
+	Table *Table                `json:"table"`
+	Items map[string]storedItem `json:"items"`
+	// projNames are the attributes projected out of every row (keys, TTL).
+	projNames []string
+	// fileID names this table's append-only log under dynamodb.d/.
+	fileID string
+	// pending holds journal records written since the last flush.
+	pending []byte
+	// liveBytes approximates the log size of the live rows, to detect garbage.
+	liveBytes int64
+	// needCompact forces a full rewrite of the log on the next flush.
+	needCompact bool
+}
+
+// storageSnapshot owns point-in-time map headers while immutable table items
+// let the background encoder share their potentially large payloads safely.
+type storageSnapshot struct {
+	Tables map[string]*tableData `json:"tables"`
+	Tags   map[string][]Tag      `json:"tags,omitempty"`
 }
 
 // NewMemoryStorage creates a new in-memory DynamoDB storage.
@@ -108,13 +128,18 @@ func NewMemoryStorage(baseURL string, opts ...Option) *MemoryStorage {
 		region:      region,
 		stopTTL:     make(chan struct{}),
 		streamStore: streams.Global,
+		persist:     persistState{fileBytes: map[string]int64{}},
 	}
 	for _, o := range opts {
 		o(s)
 	}
 
+	// Fail hard on unreadable data: serving empty would let the next flush
+	// overwrite the user's tables.
 	if s.dataDir != "" {
-		_ = storage.Load(s.dataDir, "dynamodb", s)
+		if err := s.loadPersisted(); err != nil {
+			panic(fmt.Sprintf("dynamodb: load %s: %v", s.dataDir, err))
+		}
 	}
 
 	go s.ttlReaper()
@@ -153,8 +178,13 @@ func (m *MemoryStorage) deleteExpiredItems() {
 
 		var keysToDelete []string
 
-		for key, item := range td.Items {
-			av, exists := item[ttlAttr]
+		for key, si := range td.Items {
+			// TTL is projected, so the reaper never decodes rows that have it.
+			av, exists, known := si.projected(ttlAttr)
+			if !known {
+				av, exists = si.decode()[ttlAttr]
+			}
+
 			if !exists || av.N == nil {
 				continue
 			}
@@ -170,7 +200,7 @@ func (m *MemoryStorage) deleteExpiredItems() {
 		}
 
 		for _, key := range keysToDelete {
-			delete(td.Items, key)
+			m.deleteStoredLocked(td, key)
 		}
 	}
 
@@ -180,11 +210,12 @@ func (m *MemoryStorage) deleteExpiredItems() {
 // MarshalJSON serializes the storage state to JSON.
 func (m *MemoryStorage) MarshalJSON() ([]byte, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	snapshot := m.snapshotLocked()
+	m.mu.RUnlock()
 
-	type Alias MemoryStorage
-
-	data, err := json.Marshal(&struct{ *Alias }{Alias: (*Alias)(m)})
+	// JSON walking is intentionally outside the global lock so persistence
+	// cannot stall otherwise independent DynamoDB requests.
+	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal: %w", err)
 	}
@@ -213,25 +244,57 @@ func (m *MemoryStorage) UnmarshalJSON(data []byte) error {
 		m.Tags = make(map[string][]Tag)
 	}
 
-	return nil
+	// Legacy JSON carries rows only; rebuild projections and log bookkeeping.
+	return m.finishLoadLocked()
 }
 
-// saveLocked persists the current state to disk while the caller holds the lock.
+// snapshotLocked captures every table at one instant without copying immutable
+// item payloads. The caller must hold m.mu for the whole capture.
+func (m *MemoryStorage) snapshotLocked() *storageSnapshot {
+	tables := make(map[string]*tableData, len(m.Tables))
+	for name, td := range m.Tables {
+		// Table metadata is small and mutable, so copy its value defensively.
+		table := *td.Table
+		items := make(map[string]storedItem, len(td.Items))
+		for key, item := range td.Items {
+			items[key] = item
+		}
+
+		tables[name] = &tableData{Table: &table, Items: items}
+	}
+
+	// Tag updates mutate slice elements, so each snapshot needs its own slice.
+	tags := make(map[string][]Tag, len(m.Tags))
+	for arn, tableTags := range m.Tags {
+		tags[arn] = cloneSlice(tableTags)
+	}
+
+	return &storageSnapshot{Tables: tables, Tags: tags}
+}
+
+// saveLocked only marks persistence dirty while the caller holds the lock. Row
+// writes were already journaled by put/deleteStoredLocked; metadata is tiny,
+// so it is simply rewritten on every flush that follows a mutation.
 func (m *MemoryStorage) saveLocked() {
 	if m.dataDir == "" {
 		return
 	}
 
-	storage.ScheduleSave(m.dataDir, "dynamodb", m.MarshalJSON)
+	m.persist.metaDirty = true
+	storage.ScheduleFlush(m.dataDir, "dynamodb", m.flush)
 }
 
-// Close saves the storage state to disk if persistence is enabled.
+// Close persists everything pending if persistence is enabled. The background
+// entry is cleared first so it cannot race this final write; a mutation after
+// that point re-marks it dirty.
 func (m *MemoryStorage) Close() error {
 	if m.dataDir == "" {
 		return nil
 	}
 
-	if err := storage.Save(m.dataDir, "dynamodb", m); err != nil {
+	storage.MarkClean(m.dataDir, "dynamodb")
+
+	if err := m.flush(); err != nil {
 		return fmt.Errorf("failed to save: %w", err)
 	}
 
@@ -283,9 +346,13 @@ func (m *MemoryStorage) CreateTable(_ context.Context, req *CreateTableRequest) 
 
 	m.setupTableStream(table, req)
 
+	// A new table gets its own log file; needCompact writes its header.
 	m.Tables[req.TableName] = &tableData{
-		Table: table,
-		Items: make(map[string]Item),
+		Table:       table,
+		Items:       make(map[string]storedItem),
+		projNames:   projectedNames(table),
+		fileID:      newTableFileID(),
+		needCompact: true,
 	}
 
 	if len(req.Tags) > 0 {
@@ -344,6 +411,9 @@ func (m *MemoryStorage) DeleteTable(_ context.Context, tableName string) (*Table
 	table.TableStatus = "DELETING"
 
 	delete(m.Tables, tableNameFromIdentifier(tableName))
+
+	// The next flush deletes the table's log after rewriting meta.
+	m.persist.removedFiles = append(m.persist.removedFiles, td.fileID)
 
 	m.saveLocked()
 
@@ -455,9 +525,14 @@ func (m *MemoryStorage) PutItem(_ context.Context, tableName string, item Item, 
 
 	key := m.serializeKey(td.Table, item)
 
+	// Decode the prior row only when something reads it: a condition, the
+	// returned old image, or a stream record. Blind overwrites stay cheap.
+	streaming := td.Table.StreamEnabled && td.Table.LatestStreamArn != ""
+	_, exists = td.Items[key]
+
 	var existingItem Item
-	if existing, ok := td.Items[key]; ok {
-		existingItem = existing
+	if exists && (cond.Expression != "" || returnOld || streaming) {
+		existingItem = td.existingItem(key)
 	}
 
 	if ok, err := evaluateCondition(existingItem, cond); err != nil {
@@ -475,14 +550,15 @@ func (m *MemoryStorage) PutItem(_ context.Context, tableName string, item Item, 
 	var oldItem Item
 
 	if returnOld && existingItem != nil {
-		oldItem = m.copyItem(existingItem)
+		oldItem = existingItem
 	}
 
-	td.Items[key] = m.copyItem(item)
+	// Encoding is itself the deep copy that isolates storage from the caller.
+	m.putStoredLocked(td, key, item)
 
-	if td.Table.StreamEnabled && td.Table.LatestStreamArn != "" {
+	if streaming {
 		eventName := streams.OperationTypeInsert
-		if existingItem != nil {
+		if exists {
 			eventName = streams.OperationTypeModify
 		}
 
@@ -541,8 +617,8 @@ func (m *MemoryStorage) GetItem(_ context.Context, tableName string, key Item) (
 	}
 
 	keyStr := m.serializeKey(td.Table, key)
-	if item, ok := td.Items[keyStr]; ok {
-		return m.copyItem(item), nil
+	if si, ok := td.Items[keyStr]; ok {
+		return si.decode(), nil
 	}
 
 	//nolint:nilnil // DynamoDB returns nil item when key not found (valid behavior).
@@ -568,10 +644,8 @@ func (m *MemoryStorage) DeleteItem(_ context.Context, tableName string, key Item
 
 	keyStr := m.serializeKey(td.Table, key)
 
-	var existingItem Item
-	if existing, ok := td.Items[keyStr]; ok {
-		existingItem = existing
-	}
+	// Delete returns/streams the old row and may condition on it, so decode it.
+	existingItem := td.existingItem(keyStr)
 
 	if ok, err := evaluateCondition(existingItem, cond); err != nil {
 		return nil, &TableError{
@@ -589,10 +663,10 @@ func (m *MemoryStorage) DeleteItem(_ context.Context, tableName string, key Item
 
 	if existingItem != nil {
 		if returnOld {
-			oldItem = m.copyItem(existingItem)
+			oldItem = existingItem
 		}
 
-		delete(td.Items, keyStr)
+		m.deleteStoredLocked(td, keyStr)
 
 		if td.Table.StreamEnabled && td.Table.LatestStreamArn != "" {
 			m.emitStreamEvent(td.Table, streams.OperationTypeRemove, key, existingItem, nil)
@@ -622,20 +696,18 @@ func (m *MemoryStorage) UpdateItem(_ context.Context, tableName string, key Item
 	}
 
 	keyStr := m.serializeKey(td.Table, key)
-	item, itemExists := td.Items[keyStr]
-
-	var condItem Item
-	if itemExists {
-		condItem = item
-	}
+	// The decoded row is caller-owned: conditions read it, then a copy mutates.
+	condItem := td.existingItem(keyStr)
+	itemExists := condItem != nil
 
 	if err := checkWriteCondition(condItem, cond); err != nil {
 		return nil, err
 	}
 
-	var oldItem Item
+	var oldItem, item Item
 	if itemExists {
-		oldItem = m.copyItem(item)
+		oldItem = condItem
+		item = m.copyItem(condItem)
 	} else {
 		item = m.copyItem(key)
 	}
@@ -649,7 +721,7 @@ func (m *MemoryStorage) UpdateItem(_ context.Context, tableName string, key Item
 		item = updated
 	}
 
-	td.Items[keyStr] = item
+	m.putStoredLocked(td, keyStr, item)
 
 	if td.Table.StreamEnabled && td.Table.LatestStreamArn != "" {
 		eventName := streams.OperationTypeInsert
@@ -809,22 +881,76 @@ func (m *MemoryStorage) matchesPartitionKey(item Item, partitionKeyName string, 
 	return m.attributeValuesEqual(itemVal, *partitionKeyValue)
 }
 
-// queryMatchingItems walks the table's items and returns those that match the
+// rowRef is a candidate row: its serialized primary key (the Items map key),
+// the projected key attributes used for key conditions and ordering, and the
+// encoded row, decoded only once the row is actually evaluated for a page.
+type rowRef struct {
+	key  string
+	view Item
+	si   storedItem
+}
+
+// projectedPartitionMatch compares a row's partition key with the queried
+// value straight from the projection, so non-matching rows cost no allocation.
+// The equality rule mirrors attributeValuesEqual for key types (S, N).
+func projectedPartitionMatch(si *storedItem, name string, want *AttributeValue) (match, known bool) {
+	for i := range si.proj {
+		p := &si.proj[i]
+		if p.name != name {
+			continue
+		}
+
+		switch {
+		case want.S != nil && p.kind == 'S':
+			return p.val == *want.S, true
+		case want.N != nil && p.kind == 'N':
+			return p.val == *want.N, true
+		default:
+			return false, true
+		}
+	}
+
+	return false, si.projComplete
+}
+
+// queryMatchingItems walks the table's rows and returns those that match the
 // partition key and the full key condition, in table order. Filtering and
 // Limit are applied afterward, once the candidates are sorted by sort key and
 // positioned past ExclusiveStartKey, so that Limit bounds evaluated items
 // rather than post-filter matches (see evaluatePage).
-func (m *MemoryStorage) queryMatchingItems(items map[string]Item, partitionKeyName string, partitionKeyValue *AttributeValue, resolvedKeyCondExpr string, exprValues map[string]AttributeValue) ([]Item, error) {
-	var candidates []Item
+func (m *MemoryStorage) queryMatchingItems(items map[string]storedItem, partitionKeyName string, partitionKeyValue *AttributeValue, resolvedKeyCondExpr string, exprValues map[string]AttributeValue) ([]rowRef, error) {
+	var candidates []rowRef
 
-	for _, item := range items {
-		if !m.matchesPartitionKey(item, partitionKeyName, partitionKeyValue) {
-			continue
+	for key, si := range items {
+		var full Item
+
+		if partitionKeyValue != nil {
+			match, known := projectedPartitionMatch(&si, partitionKeyName, partitionKeyValue)
+			if !known {
+				// Non-scalar projected attribute: answer from the decoded row.
+				full = si.decode()
+				match = m.matchesPartitionKey(full, partitionKeyName, partitionKeyValue)
+			}
+
+			if !match {
+				continue
+			}
+		}
+
+		// Key conditions reference only key attributes, all of which are
+		// projected; an incomplete projection falls back to the decoded row.
+		view := si.keyView()
+		if view == nil {
+			if full == nil {
+				full = si.decode()
+			}
+
+			view = full
 		}
 
 		// Full key condition covers RANGE conditions like >=, BETWEEN, begins_with.
 		if resolvedKeyCondExpr != "" {
-			ok, err := evaluateCondition(item, ConditionInput{Expression: resolvedKeyCondExpr, ExprValues: exprValues})
+			ok, err := evaluateCondition(view, ConditionInput{Expression: resolvedKeyCondExpr, ExprValues: exprValues})
 			if err != nil {
 				return nil, invalidKeyConditionExpression(err)
 			}
@@ -834,7 +960,7 @@ func (m *MemoryStorage) queryMatchingItems(items map[string]Item, partitionKeyNa
 			}
 		}
 
-		candidates = append(candidates, item)
+		candidates = append(candidates, rowRef{key: key, view: view, si: si})
 	}
 
 	return candidates, nil
@@ -844,11 +970,11 @@ func (m *MemoryStorage) queryMatchingItems(items map[string]Item, partitionKeyNa
 // always returns items in sort-key order) and reverses them in place when
 // scanForward is false. A table/index without a sort key is left in its
 // original (arbitrary map iteration) order.
-func (m *MemoryStorage) orderQueryCandidates(candidates []Item, sortKeyName string, scanForward bool) {
+func (m *MemoryStorage) orderQueryCandidates(candidates []rowRef, sortKeyName string, scanForward bool) {
 	if sortKeyName != "" {
 		sort.Slice(candidates, func(i, j int) bool {
-			vi := candidates[i][sortKeyName]
-			vj := candidates[j][sortKeyName]
+			vi := candidates[i].view[sortKeyName]
+			vj := candidates[j].view[sortKeyName]
 
 			return m.compareForSort(&vi, &vj)
 		})
@@ -862,17 +988,17 @@ func (m *MemoryStorage) orderQueryCandidates(candidates []Item, sortKeyName stri
 }
 
 // startIndexAfterKey returns the index in ordered immediately following the
-// item whose primary key matches exclusiveStartKey, or 0 when
+// row whose primary key matches exclusiveStartKey, or 0 when
 // exclusiveStartKey is nil or not found among ordered.
-func (m *MemoryStorage) startIndexAfterKey(table *Table, ordered []Item, exclusiveStartKey Item) int {
+func (m *MemoryStorage) startIndexAfterKey(table *Table, ordered []rowRef, exclusiveStartKey Item) int {
 	if exclusiveStartKey == nil {
 		return 0
 	}
 
 	startKeyStr := m.serializeKey(table, exclusiveStartKey)
 
-	for i, item := range ordered {
-		if m.serializeKey(table, item) == startKeyStr {
+	for i, r := range ordered {
+		if r.key == startKeyStr {
 			return i + 1
 		}
 	}
@@ -889,17 +1015,20 @@ func (m *MemoryStorage) startIndexAfterKey(table *Table, ordered []Item, exclusi
 // evaluated item's key when evaluation stopped early because Limit was
 // reached while candidates remained, and is nil once candidates are
 // exhausted (even if that happens to coincide with Limit).
-func (m *MemoryStorage) evaluatePage(table *Table, candidates []Item, filterExpr string, exprNames map[string]string, exprValues map[string]AttributeValue, limit int) ([]Item, Item, int, error) {
+func (m *MemoryStorage) evaluatePage(table *Table, candidates []rowRef, filterExpr string, exprNames map[string]string, exprValues map[string]AttributeValue, limit int) ([]Item, Item, int, error) {
 	items := []Item{}
 
-	for i, item := range candidates {
+	for i := range candidates {
+		// Decoding yields a fresh caller-owned item, so no extra copy is needed.
+		item := candidates[i].si.decode()
+
 		match, err := m.filterItem(item, filterExpr, exprNames, exprValues)
 		if err != nil {
 			return nil, nil, 0, err
 		}
 
 		if match {
-			items = append(items, m.copyItem(item))
+			items = append(items, item)
 		}
 
 		scannedCount := i + 1
@@ -940,7 +1069,7 @@ func (m *MemoryStorage) Scan(_ context.Context, tableName, filterExpr string, ex
 		return nil, nil, 0, err
 	}
 
-	// Collect the segment's candidate items; filtering and Limit are applied
+	// Collect the segment's candidate rows; filtering and Limit are applied
 	// once the candidates are ordered by primary key and positioned past
 	// ExclusiveStartKey (see evaluatePage).
 	candidates := m.scanCandidateItems(td, segment, totalSegments)
@@ -955,27 +1084,17 @@ func (m *MemoryStorage) Scan(_ context.Context, tableName, filterExpr string, ex
 
 // sortByKeyAndEvaluate orders scan candidates by serialized primary key (Scan
 // has no sort-key ordering), positions past ExclusiveStartKey, and then
-// evaluates up to Limit items against the filter via evaluatePage. Keys are
-// pre-computed once so neither the sort nor the start-key lookup re-serializes.
-func (m *MemoryStorage) sortByKeyAndEvaluate(table *Table, candidates []Item, exclusiveStartKey Item, filterExpr string, exprNames map[string]string, exprValues map[string]AttributeValue, limit int) ([]Item, Item, int, error) {
-	type keyedItem struct {
-		key  string
-		item Item
-	}
-
-	pairs := make([]keyedItem, len(candidates))
-	for i, it := range candidates {
-		pairs[i] = keyedItem{key: m.serializeKey(table, it), item: it}
-	}
-
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+// evaluates up to Limit items against the filter via evaluatePage. The map key
+// already is the serialized primary key, so nothing is re-serialized.
+func (m *MemoryStorage) sortByKeyAndEvaluate(table *Table, candidates []rowRef, exclusiveStartKey Item, filterExpr string, exprNames map[string]string, exprValues map[string]AttributeValue, limit int) ([]Item, Item, int, error) {
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].key < candidates[j].key })
 
 	startIdx := 0
 
 	if exclusiveStartKey != nil {
 		startKeyStr := m.serializeKey(table, exclusiveStartKey)
-		for i, p := range pairs {
-			if p.key == startKeyStr {
+		for i, r := range candidates {
+			if r.key == startKeyStr {
 				startIdx = i + 1
 
 				break
@@ -983,31 +1102,25 @@ func (m *MemoryStorage) sortByKeyAndEvaluate(table *Table, candidates []Item, ex
 		}
 	}
 
-	ordered := make([]Item, 0, len(pairs))
-	for _, p := range pairs {
-		ordered = append(ordered, p.item)
-	}
-
-	if startIdx >= len(ordered) {
+	if startIdx >= len(candidates) {
 		return []Item{}, nil, 0, nil
 	}
 
-	return m.evaluatePage(table, ordered[startIdx:], filterExpr, exprNames, exprValues, limit)
+	return m.evaluatePage(table, candidates[startIdx:], filterExpr, exprNames, exprValues, limit)
 }
 
-// scanCandidateItems walks every item and applies parallel-scan segment
-// filtering, returning the segment's candidate items in table order.
-// FilterExpression and Limit are applied afterward by the caller.
-func (m *MemoryStorage) scanCandidateItems(td *tableData, segment, totalSegments *int) []Item {
-	var candidates []Item
+// scanCandidateItems walks every row and applies parallel-scan segment
+// filtering, returning the segment's candidates in table order without
+// decoding them. FilterExpression and Limit are applied afterward.
+func (m *MemoryStorage) scanCandidateItems(td *tableData, segment, totalSegments *int) []rowRef {
+	var candidates []rowRef
 
-	for _, item := range td.Items {
-		key := m.serializeKey(td.Table, item)
+	for key, si := range td.Items {
 		if !scanSegmentMatches(key, segment, totalSegments) {
 			continue
 		}
 
-		candidates = append(candidates, item)
+		candidates = append(candidates, rowRef{key: key, si: si})
 	}
 
 	return candidates
@@ -2057,9 +2170,10 @@ func (m *MemoryStorage) checkTransactCondition(tableName string, keyOrItem Item,
 
 	key := m.serializeKey(td.Table, keyOrItem)
 
+	// Only a real condition reads the row; skip decoding for unconditional writes.
 	var existing Item
-	if e, ok := td.Items[key]; ok {
-		existing = e
+	if cond.Expression != "" {
+		existing = td.existingItem(key)
 	}
 
 	ok, err := evaluateCondition(existing, cond)
@@ -2080,19 +2194,20 @@ func (m *MemoryStorage) applyTransactWriteItem(twi TransactWriteItem) {
 	case twi.Put != nil:
 		td := m.Tables[tableNameFromIdentifier(twi.Put.TableName)]
 		key := m.serializeKey(td.Table, twi.Put.Item)
-		td.Items[key] = m.copyItem(twi.Put.Item)
+		m.putStoredLocked(td, key, twi.Put.Item)
 
 	case twi.Delete != nil:
 		td := m.Tables[tableNameFromIdentifier(twi.Delete.TableName)]
 		key := m.serializeKey(td.Table, twi.Delete.Key)
-		delete(td.Items, key)
+		m.deleteStoredLocked(td, key)
 
 	case twi.Update != nil:
 		td := m.Tables[tableNameFromIdentifier(twi.Update.TableName)]
 		key := m.serializeKey(td.Table, twi.Update.Key)
 
-		item, ok := td.Items[key]
-		if !ok {
+		// Decoding yields a private copy, so the update mutates nothing shared.
+		item := td.existingItem(key)
+		if item == nil {
 			item = m.copyItem(twi.Update.Key)
 		}
 
@@ -2100,7 +2215,7 @@ func (m *MemoryStorage) applyTransactWriteItem(twi TransactWriteItem) {
 			item = m.applyUpdateExpression(item, twi.Update.UpdateExpression, twi.Update.ExpressionAttributeNames, twi.Update.ExpressionAttributeValues)
 		}
 
-		td.Items[key] = item
+		m.putStoredLocked(td, key, item)
 	case twi.ConditionCheck != nil:
 	}
 }
@@ -2130,8 +2245,8 @@ func (m *MemoryStorage) TransactGetItems(_ context.Context, items []TransactGetI
 		}
 
 		key := m.serializeKey(td.Table, tgi.Get.Key)
-		if item, ok := td.Items[key]; ok {
-			results[i] = m.copyItem(item)
+		if si, ok := td.Items[key]; ok {
+			results[i] = si.decode()
 		}
 	}
 
@@ -2164,14 +2279,14 @@ func (m *MemoryStorage) BatchWriteItem(_ context.Context, requestItems map[strin
 				}
 
 				key := m.serializeKey(td.Table, req.PutRequest.Item)
-				td.Items[key] = m.copyItem(req.PutRequest.Item)
+				m.putStoredLocked(td, key, req.PutRequest.Item)
 			case req.DeleteRequest != nil:
 				if err := validateKey(td.Table, req.DeleteRequest.Key); err != nil {
 					return nil, err
 				}
 
 				key := m.serializeKey(td.Table, req.DeleteRequest.Key)
-				delete(td.Items, key)
+				m.deleteStoredLocked(td, key)
 			}
 		}
 	}
@@ -2221,8 +2336,8 @@ func (m *MemoryStorage) BatchGetItem(_ context.Context, requestItems map[string]
 			}
 
 			keyStr := m.serializeKey(td.Table, key)
-			if item, ok := td.Items[keyStr]; ok {
-				items = append(items, m.copyItem(item))
+			if si, ok := td.Items[keyStr]; ok {
+				items = append(items, si.decode())
 			}
 		}
 
@@ -2244,6 +2359,11 @@ func (m *MemoryStorage) UpdateTimeToLive(_ context.Context, tableName, attribute
 
 	td.Table.TTLAttributeName = attributeName
 	td.Table.TTLEnabled = enabled
+
+	// The TTL attribute joins the per-row projection so the reaper stays cheap.
+	if err := td.reprojectAll(); err != nil {
+		return fmt.Errorf("reproject %s: %w", tableName, err)
+	}
 
 	m.saveLocked()
 

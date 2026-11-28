@@ -454,10 +454,17 @@ When enabled:
 $KUMO_DATA_DIR/
   s3.json
   sqs.json
-  dynamodb.json
+  dynamodb.d/          # DynamoDB (format v2)
+    meta.json          #   version, table metadata, tags
+    <uuid>.items       #   one append-only binary log per table
   iam.json
   ...
 ```
+
+DynamoDB persists incrementally: each flush appends only the rows written since
+the previous one, and a table log is compacted when its garbage exceeds its live
+data. Rows are held in memory as compact binary. A v1 `dynamodb.json` is
+migrated to `dynamodb.d/` on first start and then removed.
 
 ## kumo-specific Endpoints
 

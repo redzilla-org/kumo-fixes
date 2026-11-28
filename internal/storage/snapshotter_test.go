@@ -30,6 +30,47 @@ func TestScheduleSave_FlushWritesSnapshot(t *testing.T) {
 	}
 }
 
+// TestScheduleSaveMutationDuringFlushRemainsDirty verifies that a successful
+// old flush cannot clear a newer mutation scheduled while marshalling.
+func TestScheduleSaveMutationDuringFlushRemainsDirty(t *testing.T) {
+	dir := t.TempDir()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+
+	storage.ScheduleSave(dir, "snaptest-inflight", func() ([]byte, error) {
+		calls.Add(1)
+		close(started)
+		<-release
+		return []byte(`{"generation":1}`), nil
+	})
+	done := make(chan struct{})
+	go func() {
+		storage.FlushSnapshots()
+		close(done)
+	}()
+	<-started
+
+	storage.ScheduleSave(dir, "snaptest-inflight", func() ([]byte, error) {
+		calls.Add(1)
+		return []byte(`{"generation":2}`), nil
+	})
+	close(release)
+	<-done
+	storage.FlushSnapshots()
+
+	data, err := os.ReadFile(filepath.Join(dir, "snaptest-inflight.json")) //nolint:gosec // fixed name under t.TempDir
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"generation":2}` {
+		t.Fatalf("new mutation was lost: %s", data)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("marshal calls=%d, want 2", calls.Load())
+	}
+}
+
 func TestScheduleSave_EmptyDataDirIsNoop(t *testing.T) {
 	// Must not panic or start writing anywhere when persistence is disabled.
 	storage.ScheduleSave("", "snaptest-noop", func() ([]byte, error) {
