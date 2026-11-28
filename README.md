@@ -515,6 +515,38 @@ Response:
 }
 ```
 
+### SNS message tap
+
+Every successful SNS `Publish` (Query API or an in-process publisher such as a CloudWatch alarm action) is recorded against its topic whether or not the topic has subscribers, so a test can observe a publish to a topic with nobody listening.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/_aws/sns/messages?topicArn=<arn>` | List the topic's recorded publishes, oldest first |
+| DELETE | `/_aws/sns/messages?topicArn=<arn>` | Clear the topic's recording; returns `{"cleared":<n>}` |
+
+```bash
+curl "http://localhost:4566/_aws/sns/messages?topicArn=arn:aws:sns:us-east-1:123456789012:my-topic"
+```
+
+Response:
+
+```json
+{
+  "messages": [
+    {
+      "MessageId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "TopicArn": "arn:aws:sns:us-east-1:123456789012:my-topic",
+      "Subject": "Hello",
+      "Message": "Hello, World!",
+      "Timestamp": "2025-01-01T00:00:00.000Z",
+      "MessageAttributes": {}
+    }
+  ]
+}
+```
+
+`Timestamp` is RFC3339 UTC with milliseconds; `MessageAttributes` is `{}` when none were sent. A missing `topicArn` is a 400 and an unknown topic lists `[]`. `DeleteTopic` also clears the topic's recording. The recording is kept in memory only.
+
 ## Development
 
 ```bash

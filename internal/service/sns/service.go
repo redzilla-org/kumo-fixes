@@ -39,9 +39,11 @@ func (s *Service) Name() string {
 }
 
 // RegisterRoutes registers routes with the router.
-// SNS uses Query protocol, so routes are registered via DispatchAction.
-func (s *Service) RegisterRoutes(_ service.Router) {
-	// SNS uses Query protocol, routing is handled by DispatchAction.
+// SNS uses Query protocol, so API routes are handled via DispatchAction.
+// The SNS message tap (tap.go) is a kumo-specific REST endpoint.
+func (s *Service) RegisterRoutes(r service.Router) {
+	r.HandleFunc("GET", snsTapPath, s.GetPublishedMessages)
+	r.HandleFunc("DELETE", snsTapPath, s.ClearPublishedMessages)
 }
 
 // TargetPrefix returns the X-Amz-Target header prefix for SNS.
