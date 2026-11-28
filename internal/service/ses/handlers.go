@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/mail"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -239,6 +241,31 @@ func (s *Service) GetIdentityVerificationAttributes(w http.ResponseWriter, r *ht
 // GetMailbox handles the kumo-specific mailbox endpoint.
 // This returns messages addressed to or sent by the selected mailbox address.
 func (s *Service) GetMailbox(w http.ResponseWriter, r *http.Request) {
+	// A correlation token selects the notification-backed API. The timeout is
+	// deliberately server-side so one request replaces a client-side polling
+	// loop while remaining bounded if the expected message never arrives.
+	if contains := r.URL.Query().Get("contains"); contains != "" {
+		waitSeconds := 10
+		if raw := r.URL.Query().Get("waitSeconds"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > 30 {
+				http.Error(w, "waitSeconds must be an integer from 1 through 30", http.StatusBadRequest)
+				return
+			}
+			waitSeconds = parsed
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(waitSeconds)*time.Second)
+		defer cancel()
+		emails, err := s.storage.WaitForEmailContaining(ctx, contains)
+		if err != nil {
+			http.Error(w, "failed to wait for mailbox", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(emails)
+		return
+	}
+
 	email := r.URL.Query().Get("email")
 	if email == "" {
 		w.Header().Set("Content-Type", "application/json")
